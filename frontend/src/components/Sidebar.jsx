@@ -2,8 +2,9 @@ import React from "react";
 import {
   Settings,
   MessageSquare,
-  Sparkles,
+  // Sparkles,
   Plus,
+  Trash2,
 } from "lucide-react";
 import { cn } from "../lib/utils";
 import hpsLogo from "../assets/HPS.png";
@@ -13,6 +14,7 @@ export function Sidebar({
   activeId = null,
   onSelect = () => {},
   onNew = () => {},
+  onDelete = () => {},
 }) {
   return (
     <aside className="sidebar">
@@ -40,26 +42,72 @@ export function Sidebar({
       <div className="sidebar-content">
         <div className="sidebar-heading">History</div>
 
-        <ul className="sidebar-list">
-          {conversations.map((conversation) => (
-            <li key={conversation.id}>
-              <button
-                type="button"
-                onClick={() => onSelect(conversation.id)}
-                className={cn(
-                  "sidebar-item",
-                  activeId === conversation.id && "sidebar-item--active",
-                )}
-              >
-                <MessageSquare className="sidebar-item__icon" />
+        {/* <ul className="sidebar-list">
+        {conversations.map((conversation) => (
+          <li key={conversation.id} className="sidebar-list__item">
+            <button
+              type="button"
+              onClick={() => onSelect(conversation.id)}
+              className={cn(
+                "sidebar-item",
+                activeId === conversation.id && "sidebar-item--active",
+              )}
+            >
+              <MessageSquare className="sidebar-item__icon" />
 
-                <span className="sidebar-item__label">
-                  {conversation.title}
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
+              <span className="sidebar-item__label">
+                {conversation.title}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              className="sidebar-item__delete"
+              aria-label={`Delete ${conversation.title}`}
+              title="Delete conversation"
+              onClick={(event) => {
+                event.stopPropagation();
+                onDelete(conversation.id);
+              }}
+            >
+              <Trash2 className="sidebar-item__delete-icon" />
+            </button>
+          </li>
+        ))}
+      </ul> */}
+
+      <ul className="sidebar-list">
+        {conversations.map((conversation) => (
+          <li key={conversation.id} className="sidebar-list__item">
+            <button
+              type="button"
+              onClick={() => onSelect(conversation.id)}
+              className={cn(
+                "sidebar-item",
+                activeId === conversation.id && "sidebar-item--active",
+              )}
+            >
+              <MessageSquare className="sidebar-item__icon" />
+
+              <span className="sidebar-item__label">
+                {conversation.title}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              className="sidebar-item__delete"
+              title="Delete conversation"
+              onClick={(event) => {
+                event.stopPropagation();
+                onDelete(conversation.id);
+              }}
+            >
+              <Trash2 className="sidebar-item__delete-icon" />
+            </button>
+          </li>
+        ))}
+      </ul>
       </div>
 
       <button className="sidebar-footer" type="button">
