@@ -4,10 +4,12 @@ import fitz  # PyMuPDF
 from docx import Document
 from openpyxl import load_workbook
 
-SUPPORTED_TEXT_EXTENSIONS = {
-    ".txt",
-    ".log",
-}
+from app.services.file_type_service import (
+    TRACE_TEXT_EXTENSIONS,
+    is_trace_extension,
+)
+
+SUPPORTED_TEXT_EXTENSIONS = TRACE_TEXT_EXTENSIONS
 
 # Taille maximale d’un segment technique extrait.
 # Ce ne sont pas encore les chunks du RAG.
@@ -453,7 +455,7 @@ def extract_document(
 
     extension = file_path.suffix.lower()
 
-    if extension in {".txt", ".log"}:
+    if is_trace_extension(extension):
         return extract_text_file(file_path)
 
     if extension == ".pdf":

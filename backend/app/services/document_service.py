@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 
 import aiofiles
 from bson import ObjectId
@@ -16,6 +17,11 @@ from app.services.extraction_service import (
     extract_document,
     mask_iso_field_002,
 )
+from app.services.file_type_service import (
+    ALLOWED_DOCUMENT_EXTENSIONS,
+    is_supported_document_extension,
+    is_trace_extension,
+)
 from app.services.hps_ai_service import (
     HpsAiConfigurationError,
     HpsAiRequestError,
@@ -23,18 +29,14 @@ from app.services.hps_ai_service import (
 )
 
 
-ALLOWED_EXTENSIONS = {
-    ".pdf",
-    ".docx",
-    ".xlsx",
-    ".txt",
-    ".log",
-}
+ALLOWED_EXTENSIONS = ALLOWED_DOCUMENT_EXTENSIONS
 
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
 MAX_CHUNK_CHARACTERS = 1_800
 CHUNK_OVERLAP_CHARACTERS = 250
 EMBEDDING_BATCH_SIZE = 32
+
+FIELD_TITLE_PATTERN = r"\bField\s+0*(?P<number>\d{1,3}(?:\.\d+)?)\s*[—-]\s*(?P<name>[A-Za-z0-9 /()_.-]+)"
 
 # backend/
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
@@ -206,6 +208,83 @@ def split_large_unit(
         start = max(end - overlap_characters, start + 1)
 
     return chunks
+
+
+def normalize_field_number(value: str) -> str:
+    if "." in value:
+        left, right = value.split(".", 1)
+        return f"{int(left):03d}.{right}" if left.isdigit() else value
+
+    return f"{int(value):03d}" if value.isdigit() else value
+
+
+def extract_field_metadata(
+    text: str,
+    heading: str | None,
+) -> dict:
+    combined_text = f"{heading or ''}\n{text}"
+    field_match = re.search(
+        FIELD_TITLE_PATTERN,
+        combined_text,
+        flags=re.IGNORECASE,
+    )
+
+    if not field_match:
+        field_match = re.search(
+            r"\b(?:Field|FLD)\s*\(?0*(?P<number>\d{1,3}(?:\.\d+)?)\)?",
+            combined_text,
+            flags=re.IGNORECASE,
+        )
+
+    if not field_match:
+        return {}
+
+    field_number = normalize_field_number(field_match.group("number"))
+    field_name = (
+        field_match.groupdict().get("name", "").strip(" .:-")
+        if "name" in field_match.groupdict()
+        else ""
+    )
+    lowered_text = combined_text.lower()
+
+    content_type = "field_related"
+
+    if "attribute" in lowered_text:
+        content_type = "field_attributes"
+    elif "description" in lowered_text:
+        content_type = "field_definition"
+    elif "usage" in lowered_text:
+        content_type = "field_usage"
+    elif "field edits" in lowered_text or "reject" in lowered_text:
+        content_type = "field_edits"
+    elif "values" in lowered_text or "codes" in lowered_text:
+        content_type = "field_values"
+
+    page_document_matches = re.findall(
+        r"\b(\d{1,2}-\d{1,3})\s+(?:Visa Confidential|BASE I Technical)",
+        combined_text,
+        flags=re.IGNORECASE,
+    )
+
+    if not page_document_matches:
+        page_document_matches = re.findall(
+            r"(?:Visa Confidential|BASE I Technical)[^\n]{0,120}\b(\d{1,2}-\d{1,3})\b",
+            combined_text,
+            flags=re.IGNORECASE,
+        )
+
+    metadata = {
+        "field_number": field_number,
+        "content_type": content_type,
+    }
+
+    if field_name:
+        metadata["field_name"] = field_name
+
+    if page_document_matches:
+        metadata["page_document"] = page_document_matches[-1]
+
+    return metadata
 
 
 async def add_embeddings_to_sections(
@@ -414,15 +493,34 @@ async def extract_and_store_document(
                 sheet = section.get("sheet")
                 paragraph = section.get("paragraph")
                 heading = section.get("heading")
+                section_metadata = {
+                    key: section.get(key)
+                    for key in (
+                        "field_number",
+                        "field_name",
+                        "content_type",
+                        "page_document",
+                    )
+                    if section.get(key) is not None
+                }
             else:
                 section_text = section
                 page = None
                 sheet = None
                 paragraph = index + 1
                 heading = None
+                section_metadata = {}
 
             if not section_text:
                 continue
+
+            section_metadata = {
+                **extract_field_metadata(
+                    text=section_text,
+                    heading=heading,
+                ),
+                **section_metadata,
+            }
 
             chunks = split_text_into_chunks(
                 section_text
@@ -445,6 +543,7 @@ async def extract_and_store_document(
                         "sheet": sheet,
                         "paragraph": paragraph,
                         "heading": heading,
+                        **section_metadata,
                         "created_at": now,
                     }
                 )
@@ -543,7 +642,7 @@ async def save_document(
         original_filename
     ).suffix.lower()
 
-    if extension not in ALLOWED_EXTENSIONS:
+    if not is_supported_document_extension(extension):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -572,7 +671,7 @@ async def save_document(
         conversation_folder / stored_filename
     )
 
-    if extension in {".txt", ".log"}:
+    if is_trace_extension(extension):
         file_size = await save_text_file_to_disk_masked(
             upload_file=upload_file,
             destination=destination,

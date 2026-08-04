@@ -14,7 +14,7 @@ import { Button } from "./ui/Button";
 
 
 const ACCEPT =
-  ".pdf,.doc,.docx,.xls,.xlsx,.txt,.log";
+  ".pdf,.doc,.docx,.xls,.xlsx,.txt,.log,.trc,.trc019,.trc068,text/plain";
 
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
 

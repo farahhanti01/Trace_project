@@ -14,6 +14,7 @@ from app.services.documentation_agent_service import (
 from app.services.log_analysis_agent_service import (
     answer_log_question,
 )
+from app.services.chat_intent_router import classify_chat_workflow
 
 app = FastAPI(
     title="TRACE AI API",
@@ -45,7 +46,12 @@ AgentType = Literal["documentation", "log"]
 
 class Reference(BaseModel):
     source: str
+    original_source: str | None = None
     page: int | None = None
+    pdf_page: int | None = None
+    printed_page: str | None = None
+    source_id: str | None = None
+    section: str | None = None
     sheet: str | None = None
     paragraph: int | None = None
 
@@ -62,15 +68,87 @@ class Issue(BaseModel):
     detail: str | None = None
 
 
+class ResponseSectionItem(BaseModel):
+    label: str
+    content: str
+
+
+class TableColumn(BaseModel):
+    key: str
+    label: str
+
+
+class ParagraphBlock(BaseModel):
+    type: Literal["paragraph"] = "paragraph"
+    content: str
+
+
+class ListBlock(BaseModel):
+    type: Literal["list"] = "list"
+    style: Literal["bullet", "numbered"] = "bullet"
+    items: list[str]
+
+
+class TableBlock(BaseModel):
+    type: Literal["table"] = "table"
+    title: str | None = None
+    columns: list[TableColumn]
+    rows: list[dict[str, str]]
+
+
+class CodeBlock(BaseModel):
+    type: Literal["code"] = "code"
+    language: str = "text"
+    content: str
+
+
+class KeyValueItem(BaseModel):
+    label: str
+    value: str
+
+
+class KeyValueBlock(BaseModel):
+    type: Literal["key_value"] = "key_value"
+    items: list[KeyValueItem]
+
+
+class CalloutBlock(BaseModel):
+    type: Literal["callout"] = "callout"
+    severity: Literal["info", "warning", "error", "success"] = "info"
+    title: str | None = None
+    content: str
+
+
+ResponseBlock = (
+    ParagraphBlock
+    | ListBlock
+    | TableBlock
+    | CodeBlock
+    | KeyValueBlock
+    | CalloutBlock
+)
+
+
+class ResponseSection(BaseModel):
+    title: str
+    content: str = ""
+    paragraphs: list[str] = Field(default_factory=list)
+    items: list[ResponseSectionItem] = Field(default_factory=list)
+    blocks: list[ResponseBlock] = Field(default_factory=list)
+    source_ids: list[str] = Field(default_factory=list)
+
+
 class StructuredResponse(BaseModel):
     summary: str
-    story: list[str] = Field(default_factory=list)
+    sections: list[ResponseSection] = Field(default_factory=list)
+    story: list[Any] = Field(default_factory=list)
     issues: list[Issue] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
     references: list[Reference] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
     transactions: list[dict[str, Any]] = Field(default_factory=list)
     statistics: dict[str, int] = Field(default_factory=dict)
+    display_options: dict[str, Any] = Field(default_factory=dict)
 
 
 class ChatRequest(BaseModel):
@@ -103,7 +181,12 @@ def health():
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    if request.agent == "log":
+    workflow = classify_chat_workflow(
+        question=request.question,
+        selected_agent=request.agent,
+    )
+
+    if workflow == "LOG_COMPLIANCE_ANALYSIS":
         result = StructuredResponse(
             **await answer_log_question(
                 question=request.question,
@@ -117,6 +200,8 @@ async def chat(request: ChatRequest):
             **await answer_documentation_question(
                 question=request.question,
                 conversation_id=request.conversation_id,
+                referenced_document_ids=request.referenced_document_ids,
+                include_all_agents=request.agent == "log",
             )
         )
 

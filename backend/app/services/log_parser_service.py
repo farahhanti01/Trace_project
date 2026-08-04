@@ -5,20 +5,27 @@ from app.services.extraction_service import mask_field_002_value
 
 
 TRANSACTION_START_PATTERN = re.compile(
-    r"\bStart\s+Dump(?:Visa|Cis)\s*\(",
+    r"\bStart\s+Dump(?:Visa|Cis|Iso|Postilion)\s*\(",
     flags=re.IGNORECASE,
 )
 MTI_PATTERN = re.compile(
-    r"\bM\.T\.I\s*:\s*\[(?P<mti>[0-9]{4})\]",
+    r"\b(?:M\.T\.I|Message\s+Type)\s*:\s*"
+    r"\[?(?P<mti>[0-9]{3,4})\]?",
     flags=re.IGNORECASE,
 )
 FIELD_PATTERN = re.compile(
     r"\bFLD\s*\(\s*0*(?P<field>002|003|037|039)\s*\)"
-    r"\s*\([^)]*\)\s*\[(?P<value>[^\]]*)\]",
+    r"\s*:?\s*\([^)]*\)\s*:?\s*\[(?P<value>[^\]]*)\]",
+    flags=re.IGNORECASE,
+)
+TLV_FIELD_PATTERN = re.compile(
+    r"^\s*(?:\S+\s+)*\d+\|\d+\|\s*"
+    r"0*(?P<field>002|003|037|039)\s*\{[^}]*\}\s*"
+    r"\d+\s+(?P<value>.+?)\s*\.?\s*$",
     flags=re.IGNORECASE,
 )
 LOG_PREFIX_PATTERN = re.compile(
-    r"^\s*\S+\s+\S+\s+\S+\s+(?P<thread>\d+)\|\d+\|\s*(?P<content>.*)$",
+    r"^\s*(?:\S+\s+)*(?P<thread>\d+)\|\d+\|\s*(?P<content>.*)$",
     flags=re.IGNORECASE,
 )
 FUNCTION_PATTERN = re.compile(
@@ -96,6 +103,8 @@ HSM_FAILURE_STATUSES = {
 MTI_LABELS = {
     "0100": "Authorization Request",
     "0110": "Authorization Response",
+    "0200": "Authorization Request",
+    "0210": "Authorization Response",
     "0800": "Network Management Request",
     "0810": "Network Management Response",
 }
@@ -114,6 +123,36 @@ def mask_field_value(
         return mask_field_002_value(cleaned_value)
 
     return cleaned_value
+
+
+def normalize_mti_value(
+    value: str,
+) -> str:
+    cleaned_value = value.strip()
+
+    if len(cleaned_value) == 3 and cleaned_value.isdigit():
+        return cleaned_value.zfill(4)
+
+    return cleaned_value
+
+
+def extract_tlv_field_value(
+    line: str,
+) -> tuple[str, str] | None:
+    match = TLV_FIELD_PATTERN.search(line)
+
+    if not match:
+        return None
+
+    field = match.group("field")
+    value = match.group("value").strip()
+
+    if field == "002":
+        # Les traces POS ajoutent souvent une empreinte technique apres le PAN
+        # masque. On conserve uniquement le premier token affichable.
+        value = value.split()[0] if value else value
+
+    return field, value
 
 
 def clean_log_line(
@@ -245,8 +284,8 @@ def parse_transaction_fields(
     for line_number, line in lines:
         mti_match = MTI_PATTERN.search(line)
 
-        if mti_match:
-            mti = mti_match.group("mti")
+        if mti_match and not mti:
+            mti = normalize_mti_value(mti_match.group("mti"))
             evidence.append({
                 "line": line_number,
                 "text": clean_log_line(line),
@@ -255,17 +294,29 @@ def parse_transaction_fields(
 
         field_match = FIELD_PATTERN.search(line)
 
-        if not field_match:
-            continue
+        is_tlv_field = False
 
-        field = field_match.group("field")
+        if field_match:
+            field = field_match.group("field")
+            value = field_match.group("value")
+        else:
+            tlv_field = extract_tlv_field_value(line)
+
+            if not tlv_field:
+                continue
+
+            field, value = tlv_field
+            is_tlv_field = True
 
         if field not in fields:
             continue
 
+        if is_tlv_field and fields.get(field):
+            continue
+
         fields[field] = mask_field_value(
             field,
-            field_match.group("value"),
+            value,
         )
         evidence.append({
             "line": line_number,
@@ -282,7 +333,7 @@ def status_from_end_args(
     normalized = args.upper()
     stripped = normalized.strip()
 
-    if re.fullmatch(r"[+]?0+", stripped):
+    if re.fullmatch(r"[+]?0+(?:\s*,\s*)*", stripped):
         return "OK"
 
     if ERROR_PATTERN.search(normalized):
@@ -607,6 +658,7 @@ def parse_hsm_analysis(
             "return_code_meaning": "",
             "functional_result": "",
             "technical_interpretation": "",
+            "trace_description": "",
             "request_message": "",
             "response_message": "",
             "message_length": "",
@@ -818,15 +870,37 @@ def parse_hsm_analysis(
             current_index is not None
             and re.search(r"verification\s+failure|verification_failed", content, re.IGNORECASE)
         ):
+            trace_description = re.sub(
+                r"[^A-Za-z0-9_ ]+",
+                " ",
+                content,
+            )
+            trace_description = re.sub(r"\s+", " ", trace_description).strip()
             commands[current_index]["status"] = merge_hsm_status(
                 commands[current_index].get("status", "UNKNOWN"),
                 "FAILED",
             )
             commands[current_index]["detected_status"] = "VERIFICATION_FAILED"
+            commands[current_index]["trace_description"] = (
+                trace_description or "Verification Failure"
+            )
             commands[current_index].setdefault("evidence", []).append({
                 "line": line_number,
                 "text": clean_log_line(mask_log_line(raw_line)),
             })
+
+    if not commands:
+        return {
+            "thread": "",
+            "commands": [],
+            "result_codes": [],
+        }
+
+    commands = [
+        command
+        for command in commands
+        if command.get("request_message") or command.get("hsm_result_code")
+    ]
 
     if not commands:
         return {
@@ -892,19 +966,27 @@ def transaction_status(
     ):
         return "FAILED"
 
-    if field_039 and field_039 != "00":
+    if field_039 and not is_success_response_code(field_039):
         return "FAILED"
 
     if any(item.get("status") == "WARNING" for item in log_story):
         return "WARNING"
 
-    if field_039 == "00" or all(
+    if (field_039 and is_success_response_code(field_039)) or all(
         item.get("status") in {"OK", "UNKNOWN"}
         for item in log_story
     ):
         return "SUCCESS"
 
     return "UNKNOWN"
+
+
+def is_success_response_code(
+    response_code: str,
+) -> bool:
+    normalized = response_code.strip()
+
+    return bool(normalized) and normalized.isdigit() and int(normalized) == 0
 
 
 def mti_label(

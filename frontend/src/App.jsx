@@ -154,6 +154,19 @@ export default function App() {
   }
 
 
+  function handleEditPrompt(prompt) {
+    setInput(prompt);
+
+    setTimeout(() => {
+      textareaRef.current?.focus();
+      textareaRef.current?.setSelectionRange(
+        prompt.length,
+        prompt.length,
+      );
+    }, 0);
+  }
+
+
   useEffect(() => {
     scrollToBottom("smooth");
   }, [activeMessages.length, sending]);
@@ -499,9 +512,10 @@ export default function App() {
         question: text,
         agent: selectedAgent,
         conversationId: convId,
-        referencedDocumentIds: selectedReferences.map(
-          (document) => document.id,
-        ),
+        referencedDocumentIds: [
+          ...attachments.map((document) => document.document_id),
+          ...selectedReferences.map((document) => document.id),
+        ].filter(Boolean),
       });
 
       const localAssistantMessage = {
@@ -663,6 +677,7 @@ export default function App() {
                 <ChatMessage
                   key={message.id}
                   message={message}
+                  onEditPrompt={handleEditPrompt}
                 />
               ))}
 

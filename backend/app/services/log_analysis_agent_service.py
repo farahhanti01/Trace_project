@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from app.database import (
     document_sections_collection,
     documents_collection,
+    messages_collection,
 )
 from app.services.documentation_agent_service import (
     build_context,
@@ -20,6 +21,9 @@ from app.services.hps_ai_service import (
     HpsAiConfigurationError,
     HpsAiRequestError,
     call_hps_ai,
+)
+from app.services.file_type_service import (
+    with_trace_extension_query,
 )
 from app.services.log_parser_service import (
     build_statistics,
@@ -54,6 +58,7 @@ FIELD_ALIASES = {
 }
 FIELD_039_REQUIRED_RESPONSE_MTIS = {
     "0110",
+    "0210",
     "0130",
     "0310",
     "0312",
@@ -87,11 +92,39 @@ HSM_ANALYSIS_TERMS = (
 LOG_STORY_TERMS = (
     "log story",
     "logstory",
-    "fonctions",
-    "fonction",
     "ordre d'apparition",
     "ordre apparition",
 )
+COMPLIANCE_RULE_EXTRACTION_PROMPT = """
+Tu es un extracteur de regles de conformite transactionnelle.
+
+Entrees:
+1. Les faits observes dans une trace ISO8583.
+2. Des passages recuperes depuis la documentation PDF officielle.
+
+Ta mission consiste uniquement a extraire les regles documentaires
+potentiellement applicables a cette transaction.
+
+N'invente aucune regle.
+N'utilise pas tes connaissances generales.
+Ne declare pas encore d'anomalie.
+
+Retourne uniquement un JSON valide avec la cle "rules".
+Si aucun passage ne contient une regle verifiable, retourne {"rules":[]}.
+""".strip()
+COMPLIANCE_AUDIT_PROMPT = """
+Tu es un auditeur de conformite.
+
+Tu recois:
+- les faits observes dans la trace;
+- les regles documentaires structurees;
+- les resultats deterministes de comparaison calcules par le backend.
+
+Tu ne dois pas modifier les resultats de comparaison.
+Une anomalie peut etre affichee uniquement lorsque la regle est applicable,
+les donnees necessaires sont disponibles, au moins une condition est VIOLATED
+et une reference documentaire exacte est disponible.
+""".strip()
 
 
 async def load_sections_for_documents(
@@ -146,39 +179,137 @@ async def load_sections_for_documents(
     return enriched_sections
 
 
-async def load_log_sections(
+def valid_object_ids(
+    document_ids: list[str],
+) -> list[ObjectId]:
+    return [
+        ObjectId(document_id)
+        for document_id in document_ids
+        if ObjectId.is_valid(document_id)
+    ]
+
+
+async def document_ids_containing_logs(
     conversation_id: str,
-) -> list[dict[str, Any]]:
+    document_ids: list[str],
+) -> list[str]:
+    object_ids = valid_object_ids(document_ids)
+
+    if not object_ids:
+        return []
+
     documents = await documents_collection.find(
-        {
+        with_trace_extension_query({
+            "_id": {"$in": object_ids},
             "conversation_id": conversation_id,
             "agent": "log",
             "status": "extracted",
-            "extension": {"$in": [".txt", ".log"]},
+        })
+    ).to_list(length=50)
+
+    return [
+        str(document["_id"])
+        for document in documents
+    ]
+
+
+async def latest_message_document_ids(
+    conversation_id: str,
+) -> list[str]:
+    cursor = messages_collection.find(
+        {
+            "conversation_id": conversation_id,
+            "role": "user",
+            "attachments.document_id": {"$exists": True},
         }
+    ).sort(
+        "created_at",
+        -1,
+    )
+    messages = await cursor.to_list(length=20)
+
+    for message in messages:
+        document_ids = [
+            attachment.get("document_id")
+            for attachment in message.get("attachments", [])
+            if attachment.get("document_id")
+        ]
+
+        if await document_ids_containing_logs(
+            conversation_id=conversation_id,
+            document_ids=document_ids,
+        ):
+            return list(dict.fromkeys(document_ids))
+
+    return []
+
+
+async def resolve_context_document_ids(
+    conversation_id: str,
+    referenced_document_ids: list[str],
+) -> list[str]:
+    current_ids = list(dict.fromkeys(referenced_document_ids))
+
+    if await document_ids_containing_logs(
+        conversation_id=conversation_id,
+        document_ids=current_ids,
+    ):
+        return current_ids
+
+    previous_ids = await latest_message_document_ids(conversation_id)
+
+    return list(dict.fromkeys([
+        *previous_ids,
+        *current_ids,
+    ]))
+
+
+async def load_log_documents(
+    conversation_id: str,
+    referenced_document_ids: list[str],
+) -> list[dict[str, Any]]:
+    object_ids = valid_object_ids(referenced_document_ids)
+    base_query = {
+        "conversation_id": conversation_id,
+        "agent": "log",
+        "status": "extracted",
+    }
+    base_query = with_trace_extension_query(base_query)
+
+    if object_ids:
+        referenced_logs = await documents_collection.find(
+            with_trace_extension_query({
+                "_id": {"$in": object_ids},
+                "conversation_id": conversation_id,
+                "agent": "log",
+                "status": "extracted",
+            })
+        ).sort(
+            "created_at",
+            1,
+        ).to_list(length=50)
+
+        if referenced_logs:
+            return referenced_logs
+
+    documents = await documents_collection.find(
+        base_query
     ).sort(
         "created_at",
         1,
     ).to_list(length=50)
 
-    return await load_sections_for_documents(documents)
+    return documents
 
 
 async def load_log_texts(
     conversation_id: str,
+    referenced_document_ids: list[str],
 ) -> dict[str, str]:
-    documents = await documents_collection.find(
-        {
-            "conversation_id": conversation_id,
-            "agent": "log",
-            "status": "extracted",
-            "extension": {"$in": [".txt", ".log"]},
-        }
-    ).sort(
-        "created_at",
-        1,
-    ).to_list(length=50)
-
+    documents = await load_log_documents(
+        conversation_id=conversation_id,
+        referenced_document_ids=referenced_document_ids,
+    )
     texts = {}
 
     for document in documents:
@@ -199,28 +330,58 @@ async def load_log_texts(
     return texts
 
 
+async def load_log_sections(
+    conversation_id: str,
+    referenced_document_ids: list[str],
+) -> list[dict[str, Any]]:
+    documents = await load_log_documents(
+        conversation_id=conversation_id,
+        referenced_document_ids=referenced_document_ids,
+    )
+
+    return await load_sections_for_documents(documents)
+
+
 async def load_reference_sections(
     conversation_id: str,
     referenced_document_ids: list[str],
 ) -> list[dict[str, Any]]:
-    object_ids = [
-        ObjectId(document_id)
-        for document_id in referenced_document_ids
-        if ObjectId.is_valid(document_id)
-    ]
+    object_ids = valid_object_ids(referenced_document_ids)
 
     if object_ids:
-        query = {
-            "_id": {"$in": object_ids},
-            "status": "extracted",
-            "extension": {"$in": [".pdf", ".xlsx"]},
-        }
-    else:
-        query = {
-            "conversation_id": conversation_id,
-            "status": "extracted",
-            "extension": {"$in": [".pdf", ".xlsx"]},
-        }
+        referenced_documents = await documents_collection.find(
+            {
+                "_id": {"$in": object_ids},
+                "conversation_id": conversation_id,
+                "status": "extracted",
+                "extension": {"$in": [".pdf", ".xlsx"]},
+            }
+        ).to_list(length=100)
+
+        if referenced_documents:
+            referenced_ids = {
+                str(document["_id"])
+                for document in referenced_documents
+            }
+            conversation_xlsx = await documents_collection.find(
+                {
+                    "conversation_id": conversation_id,
+                    "status": "extracted",
+                    "extension": ".xlsx",
+                    "_id": {"$nin": valid_object_ids(list(referenced_ids))},
+                }
+            ).to_list(length=100)
+
+            return await load_sections_for_documents([
+                *referenced_documents,
+                *conversation_xlsx,
+            ])
+
+    query = {
+        "conversation_id": conversation_id,
+        "status": "extracted",
+        "extension": {"$in": [".pdf", ".xlsx"]},
+    }
 
     documents = await documents_collection.find(query).to_list(length=100)
 
@@ -342,14 +503,27 @@ def extract_query_constraints(
         )
     constraints["hsm_result_codes"] = list(hsm_result_codes)
 
-    constraints["hsm_commands"] = list({
-        match.group(1).upper()
-        for match in re.finditer(
-            r"\b(?:command|commande|command_)\s*_?\s*([A-Z0-9]{2,4})\b",
-            question,
-            flags=re.IGNORECASE,
-        )
-    })
+    ignored_hsm_command_words = {
+        "HSM",
+        "HOST",
+        "CODE",
+        "CODES",
+        "RETOUR",
+        "REPONSE",
+        "RESPONSE",
+    }
+    constraints["hsm_commands"] = [
+        command
+        for command in {
+            match.group(1).upper()
+            for match in re.finditer(
+                r"\b(?:command|commande|command_)\s*_?\s*([A-Z0-9]{2,4})\b",
+                question,
+                flags=re.IGNORECASE,
+            )
+        }
+        if command not in ignored_hsm_command_words
+    ]
 
     constraints["functions"] = [
         match.group(0)
@@ -414,15 +588,26 @@ def display_options_for_question(
 
     if wants_total:
         return {
+            "analysis_mode": "total",
             "show_fields": True,
             "show_log_story": True,
             "show_hsm": True,
             "show_documentation_findings": True,
         }
 
+    if wants_hsm:
+        return {
+            "analysis_mode": "hsm",
+            "show_fields": False,
+            "show_log_story": False,
+            "show_hsm": True,
+            "show_documentation_findings": True,
+        }
+
     if only_hsm:
         return {
-            "show_fields": True,
+            "analysis_mode": "hsm",
+            "show_fields": False,
             "show_log_story": False,
             "show_hsm": True,
             "show_documentation_findings": True,
@@ -430,6 +615,7 @@ def display_options_for_question(
 
     if only_log_story:
         return {
+            "analysis_mode": "log",
             "show_fields": True,
             "show_log_story": True,
             "show_hsm": False,
@@ -437,9 +623,10 @@ def display_options_for_question(
         }
 
     return {
+        "analysis_mode": "log",
         "show_fields": True,
         "show_log_story": True,
-        "show_hsm": True,
+        "show_hsm": False,
         "show_documentation_findings": True,
     }
 
@@ -894,48 +1081,20 @@ def observed_pdf_anomalies(
     mti = transaction.get("mti")
     anomalies = []
 
-    if not transaction.get("mti"):
-        anomalies.append({
-            "type": "missing_mti",
-            "anomaly": "MTI is missing from the transaction block.",
-            "observed_value": "missing",
-            "query_terms": "MTI message type authorization request response",
-        })
-
-    for field in ("002", "003", "037"):
-        if not fields.get(field):
-            anomalies.append({
-                "type": f"missing_field_{field}",
-                "anomaly": f"FLD {field} is missing from the transaction.",
-                "observed_value": "missing",
-                "query_terms": f"Field {field} authorization message required",
-            })
-
+    # A documentation anomaly must be demonstrated by an explicit PDF rule.
+    # Missing request fields or a non-00 response code are trace facts only;
+    # they are not documentary anomalies unless a matching PDF rule proves it.
     if mti in FIELD_039_REQUIRED_RESPONSE_MTIS and not fields.get("039"):
         anomalies.append({
             "type": "missing_response_field_039",
-            "anomaly": (
-                f"FLD 039 is missing from response MTI {mti}."
-            ),
+            "field": "039",
+            "anomaly": f"FLD 039 is missing from response MTI {mti}.",
             "observed_value": "missing",
+            "expected_condition": f"FLD 039 present in response MTI {mti}",
+            "context": f"MTI {mti} response message",
             "query_terms": (
                 "Field 39 is required in all 0110 0130 0310 0312 "
                 "0410 0430 responses reject code 0294 Field missing"
-            ),
-        })
-
-    if (
-        mti in FIELD_039_REQUIRED_RESPONSE_MTIS
-        and fields.get("039")
-        and fields.get("039") != "00"
-    ):
-        anomalies.append({
-            "type": "response_code_failure",
-            "anomaly": "FLD 039 indicates a non-approved authorization response.",
-            "observed_value": fields["039"],
-            "query_terms": (
-                f"Field 039 response code {fields['039']} "
-                "authorization response error decline"
             ),
         })
 
@@ -956,42 +1115,183 @@ def pdf_section_supports_anomaly(
     anomaly_type = anomaly.get("type", "")
 
     if anomaly_type == "missing_response_field_039":
-        return (
-            "field 39 is required" in text
-            or "0294 = field missing" in text
-            or (
-                "field 39" in text
-                and "required in all" in text
-                and "0110" in text
-            )
-        )
-
-    if anomaly_type == "response_code_failure":
-        return (
-            "field 039" in text
+        mti_match = re.search(r"\b(\d{4})\b", anomaly.get("context", ""))
+        mti = mti_match.group(1) if mti_match else ""
+        has_field_39 = (
+            "field 39" in text
+            or "field 039" in text
             or "response code" in text
-            or "action code" in text
-            or "authorization response" in text
         )
-
-    if anomaly_type == "missing_mti":
-        return (
-            "mti" in text
-            or "message type" in text
-            or "message identification" in text
+        has_required_rule = (
+            "required in all" in text
+            or "must be present" in text
+            or "mandatory" in text
         )
-
-    field_match = re.search(r"missing_field_(\d+)", anomaly_type)
-
-    if field_match:
-        field = field_match.group(1)
+        has_applicable_context = (
+            "all responses" in text
+            or "response message" in text
+            or "responses" in text
+            or (mti and mti in text)
+        )
         return (
-            f"field {int(field)}" in text
-            or f"field {field}" in text
-            or f"fld {field}" in text
+            has_field_39
+            and has_required_rule
+            and has_applicable_context
         )
 
     return False
+
+
+def build_rule_from_anomaly(
+    anomaly: dict[str, str],
+    section: dict[str, Any],
+    excerpt: str,
+) -> dict[str, Any]:
+    reference = reference_from_section(section)
+
+    return {
+        "rule_id": anomaly.get("type") or "",
+        "description": excerpt,
+        "applicability": {
+            "mti": [
+                value
+                for value in re.findall(
+                    r"\b\d{4}\b",
+                    anomaly.get("context", ""),
+                )
+            ],
+            "processing_codes": [],
+            "response_codes": [],
+            "required_context": [
+                anomaly.get("context", ""),
+            ],
+        },
+        "conditions": [
+            {
+                "field": anomaly.get("field", ""),
+                "operator": "present",
+                "expected": anomaly.get("expected_condition", "present"),
+            }
+        ],
+        "exceptions": [],
+        "reference": {
+            "document": reference.get("source", ""),
+            "page": reference.get("page"),
+            "section": section.get("heading") or reference.get("section", ""),
+            "table": "",
+        },
+        "source_reference": reference,
+    }
+
+
+def transaction_field_value(
+    transaction: dict[str, Any],
+    field: str,
+) -> Any:
+    if not field:
+        return None
+
+    normalized_field = str(field).zfill(3)
+    return (transaction.get("fields") or {}).get(normalized_field)
+
+
+def condition_comparison_result(
+    transaction: dict[str, Any],
+    condition: dict[str, Any],
+) -> dict[str, Any]:
+    field = str(condition.get("field") or "").zfill(3)
+    operator = condition.get("operator")
+    observed = transaction_field_value(transaction, field)
+    expected = condition.get("expected")
+
+    if operator == "present":
+        if observed is None or observed == "":
+            status = "VIOLATED"
+        else:
+            status = "COMPLIANT"
+    elif operator == "absent":
+        status = "COMPLIANT" if not observed else "VIOLATED"
+    elif operator == "equals":
+        status = "COMPLIANT" if str(observed) == str(expected) else "VIOLATED"
+    elif operator == "not_equals":
+        status = "COMPLIANT" if str(observed) != str(expected) else "VIOLATED"
+    elif operator == "one_of":
+        expected_values = expected if isinstance(expected, list) else []
+        status = (
+            "COMPLIANT"
+            if observed in expected_values
+            else "VIOLATED"
+        )
+    elif operator == "numeric_zero":
+        status = (
+            "COMPLIANT"
+            if str(observed or "").isdigit() and int(str(observed)) == 0
+            else "VIOLATED"
+        )
+    else:
+        status = "NOT_VERIFIABLE"
+
+    return {
+        "field": field,
+        "operator": operator,
+        "observed": observed if observed not in {None, ""} else "missing",
+        "expected": expected,
+        "status": status,
+    }
+
+
+def rule_applicability_result(
+    transaction: dict[str, Any],
+    rule: dict[str, Any],
+) -> str:
+    applicability = rule.get("applicability") or {}
+    applicable_mtis = [
+        str(value)
+        for value in applicability.get("mti", [])
+        if value
+    ]
+
+    if applicable_mtis and transaction.get("mti") not in applicable_mtis:
+        return "NOT_APPLICABLE"
+
+    return "APPLICABLE"
+
+
+def compare_transaction_to_rule(
+    transaction: dict[str, Any],
+    rule: dict[str, Any],
+) -> dict[str, Any]:
+    applicability = rule_applicability_result(transaction, rule)
+
+    if applicability != "APPLICABLE":
+        return {
+            "rule_id": rule.get("rule_id", ""),
+            "status": applicability,
+            "condition_results": [],
+        }
+
+    condition_results = [
+        condition_comparison_result(transaction, condition)
+        for condition in rule.get("conditions", [])
+    ]
+
+    if not condition_results:
+        status = "NOT_VERIFIABLE"
+    elif any(item["status"] == "VIOLATED" for item in condition_results):
+        status = "ANOMALY"
+    elif any(
+        item["status"] == "NOT_VERIFIABLE"
+        for item in condition_results
+    ):
+        status = "NOT_VERIFIABLE"
+    else:
+        status = "COMPLIANT"
+
+    return {
+        "rule_id": rule.get("rule_id", ""),
+        "status": status,
+        "condition_results": condition_results,
+    }
 
 
 def build_pdf_documentation_findings(
@@ -1014,19 +1314,46 @@ def build_pdf_documentation_findings(
                 question=f"{query} {anomaly.get('query_terms', '')}",
                 text=section.get("text", ""),
             )
-            reference = reference_from_section(section)
+            rule = build_rule_from_anomaly(
+                anomaly=anomaly,
+                section=section,
+                excerpt=excerpt,
+            )
+            comparison = compare_transaction_to_rule(
+                transaction=transaction,
+                rule=rule,
+            )
+
+            if comparison.get("status") != "ANOMALY":
+                continue
+
+            reference = rule.get("source_reference") or {}
+            violated_conditions = [
+                item
+                for item in comparison.get("condition_results", [])
+                if item.get("status") == "VIOLATED"
+            ]
+            primary_violation = violated_conditions[0] if violated_conditions else {}
 
             findings.append({
                 "source_type": "pdf",
                 "type": "anomaly_justification",
                 "anomaly": anomaly["anomaly"],
-                "observed_value": anomaly["observed_value"],
+                "field": anomaly.get("field", ""),
+                "observed_value": primary_violation.get(
+                    "observed",
+                    anomaly["observed_value"],
+                ),
+                "expected_condition": anomaly.get("expected_condition", ""),
+                "context": anomaly.get("context", ""),
                 "expected_rule": excerpt,
                 "explanation": (
-                    "The observed value is treated as an anomaly because "
-                    "the referenced PDF section provides the applicable "
-                    "message or field rule."
+                    "La regle documentaire s'applique au contexte de la "
+                    "transaction et la valeur observee la viole clairement."
                 ),
+                "rule": rule,
+                "comparison": comparison,
+                "conclusion": "Anomalie demontree par la documentation",
                 **reference,
                 "heading": section.get("heading"),
                 "evidence": excerpt,
@@ -1141,7 +1468,7 @@ async def build_hsm_documentation_findings(
     findings = []
 
     for command in hsm_analysis.get("commands", []):
-        if not command.get("hsm_result_code"):
+        if not command.get("request_message") and not command.get("hsm_result_code"):
             continue
 
         command_query = " ".join([
@@ -1423,6 +1750,49 @@ def deterministic_summary(
     )
 
 
+def question_requests_hsm(
+    question: str,
+) -> bool:
+    normalized_question = normalize_question_text(question)
+
+    return any(
+        term in normalized_question
+        for term in HSM_ANALYSIS_TERMS
+    )
+
+
+def hsm_command_count(
+    transactions: list[dict[str, Any]],
+) -> int:
+    return sum(
+        len((transaction.get("hsm_analysis") or {}).get("commands", []))
+        for transaction in transactions
+    )
+
+
+def no_hsm_analysis_message(
+    summary: str,
+) -> str:
+    return (
+        "Aucune interaction HSM n'a ete detectee dans la trace active. "
+        "Le parser a cherche les marqueurs TO HSM, FROM HSM, "
+        "HsmResultCode, command_XX(), WriteBalHsm, ReadBalHsm et "
+        "HsmQuery, mais aucun bloc HSM exploitable n'a ete trouve. "
+        f"{summary}"
+    )
+
+
+def no_hsm_issue() -> dict[str, str]:
+    return {
+        "severity": "warning",
+        "title": "No HSM interaction found",
+        "detail": (
+            "La trace active ne contient pas de commande HSM detectable "
+            "avec les marqueurs supportes."
+        ),
+    }
+
+
 def apply_deterministic_enrichment(
     transactions: list[dict[str, Any]],
 ) -> None:
@@ -1514,6 +1884,10 @@ def response_transactions(
     question: str,
 ) -> list[dict[str, Any]]:
     normalized_question = normalize_question_text(question)
+    wants_hsm_focus = (
+        any(term in normalized_question for term in HSM_ANALYSIS_TERMS)
+        and not any(term in normalized_question for term in TOTAL_ANALYSIS_TERMS)
+    )
     only_failures = any(
         term in normalized_question
         for term in (
@@ -1526,6 +1900,15 @@ def response_transactions(
             "nok",
         )
     )
+    hsm_transactions = [
+        transaction
+        for transaction in transactions
+        if (transaction.get("hsm_analysis") or {}).get("commands")
+    ]
+
+    if wants_hsm_focus:
+        return hsm_transactions[:MAX_RESPONSE_TRANSACTIONS]
+
     important_transactions = [
         transaction
         for transaction in transactions
@@ -1661,15 +2044,25 @@ async def answer_log_question(
             detail="A conversation_id is required for Log Analysis Agent.",
         )
 
-    log_texts = await load_log_texts(conversation_id)
+    effective_document_ids = await resolve_context_document_ids(
+        conversation_id=conversation_id,
+        referenced_document_ids=referenced_document_ids,
+    )
+    log_texts = await load_log_texts(
+        conversation_id=conversation_id,
+        referenced_document_ids=effective_document_ids,
+    )
     log_sections = []
 
     if not log_texts:
-        log_sections = await load_log_sections(conversation_id)
+        log_sections = await load_log_sections(
+            conversation_id=conversation_id,
+            referenced_document_ids=effective_document_ids,
+        )
 
     reference_sections = await load_reference_sections(
         conversation_id=conversation_id,
-        referenced_document_ids=referenced_document_ids,
+        referenced_document_ids=effective_document_ids,
     )
     display_options = display_options_for_question(question)
 
@@ -1677,7 +2070,7 @@ async def answer_log_question(
         return {
             "summary": (
                 "Aucune trace extraite n'est disponible dans cette "
-                "conversation. Ajoute un fichier .log ou .txt avec "
+                "conversation. Ajoute un fichier trace (.txt, .log ou .trcNNN) avec "
                 "Log Analysis Agent, puis repose ta question."
             ),
             "story": [],
@@ -1767,6 +2160,26 @@ async def answer_log_question(
             )
 
     selected_response_transactions = selected_response_transactions or []
+    issues = []
+    recommendations = []
+
+    if question_requests_hsm(question) and hsm_command_count(transactions) == 0:
+        summary = no_hsm_analysis_message(summary)
+        issues.append(no_hsm_issue())
+        recommendations.extend([
+            "Verifier que le fichier attache est bien la trace qui contient les lignes TO HSM / FROM HSM.",
+            "Si les commandes HSM utilisent un autre format de ligne, fournir un extrait pour ajouter ce marqueur au parser.",
+        ])
+    elif (
+        question_requests_hsm(question)
+        and not selected_response_transactions
+    ):
+        summary = no_hsm_analysis_message(summary)
+        issues.append(no_hsm_issue())
+        recommendations.extend([
+            "Verifier que le fichier attache est bien la trace qui contient les lignes TO HSM / FROM HSM.",
+            "Si tu veux reutiliser la derniere trace HSM, pose la question sans attacher une autre trace.",
+        ])
 
     statistics["matched_transactions"] = len(selected_response_transactions)
     statistics["returned_transactions"] = len(
@@ -1776,8 +2189,8 @@ async def answer_log_question(
     return {
         "summary": summary,
         "story": [],
-        "issues": [],
-        "recommendations": [],
+        "issues": issues,
+        "recommendations": recommendations,
         # "references": [],
         # "evidence": [],
         "transactions": selected_response_transactions,

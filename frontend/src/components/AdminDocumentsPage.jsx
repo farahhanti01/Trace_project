@@ -22,6 +22,7 @@ import {
 
 
 const LOG_EXTENSIONS = new Set([".txt", ".log"]);
+const TRC_EXTENSION_PATTERN = /^\.trc\d+$/i;
 
 
 function formatDate(value) {
@@ -45,7 +46,9 @@ function formatSize(size) {
 
 
 function isTrace(document) {
-  return LOG_EXTENSIONS.has(document?.extension);
+  const extension = document?.extension ?? "";
+
+  return LOG_EXTENSIONS.has(extension) || TRC_EXTENSION_PATTERN.test(extension);
 }
 
 

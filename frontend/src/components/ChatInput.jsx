@@ -236,7 +236,7 @@ export const MessageInput = forwardRef(
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.log"
+              accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.log,.trc,.trc019,.trc068,text/plain"
               className="composer__file-input"
               onChange={handleFileChange}
             />

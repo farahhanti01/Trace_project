@@ -9,18 +9,13 @@ const severityStyles = {
 
 export function AIResponseCard({ data }) {
   const hasTransactions = data.transactions && data.transactions.length > 0
-  const displayOptions = {
-    show_fields: true,
-    show_log_story: true,
-    show_hsm: true,
-    show_documentation_findings: true,
-    ...(data.display_options ?? {}),
-  }
+  const hasDocumentationSections = data.sections && data.sections.length > 0
+  const displayOptions = getDisplayOptions(data)
 
   return (
     <section className="response-card">
       {data.summary && (
-        <ResponseSection icon={ScrollText} title="Summary">
+        <ResponseSection icon={ScrollText} title="Résumé">
           <p className="response-card__paragraph">{data.summary}</p>
         </ResponseSection>
       )}
@@ -45,7 +40,44 @@ export function AIResponseCard({ data }) {
         </ResponseSection>
       )}
 
-      {!hasTransactions && data.story && data.story.length > 0 && (
+      {!hasTransactions && hasDocumentationSections && (
+        <ResponseSection icon={BookOpen} title="Analyse" bordered>
+          <div className="response-doc-sections">
+            {data.sections.map((section, i) => (
+              <article key={`${section.title ?? 'section'}-${i}`} className="response-doc-section">
+                {section.title && <h4>{section.title}</h4>}
+                {section.blocks && section.blocks.length > 0 ? (
+                  <div className="response-doc-section__blocks">
+                    {deduplicateBlocks(section.blocks).map((block, index) => (
+                      <ResponseBlock key={index} block={block} />
+                    ))}
+                  </div>
+                ) : section.paragraphs && section.paragraphs.length > 0 ? (
+                  section.paragraphs.map((paragraph, index) => (
+                    <p key={index} className="response-doc-section__paragraph">
+                      {paragraph}
+                    </p>
+                  ))
+                ) : (
+                  section.content && <p className="response-doc-section__paragraph">{section.content}</p>
+                )}
+                {section.items && section.items.length > 0 && (
+                  <ul className="response-doc-section__items">
+                    {section.items.map((item, index) => (
+                      <li key={index}>
+                        <strong>{item.label}</strong>
+                        <span>{item.content}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </article>
+            ))}
+          </div>
+        </ResponseSection>
+      )}
+
+      {!hasTransactions && !hasDocumentationSections && data.story && data.story.length > 0 && (
         <ResponseSection icon={BookOpen} title="Details" bordered>
           <ol className="response-story-list">
             {data.story.map((step, i) => (
@@ -55,6 +87,19 @@ export function AIResponseCard({ data }) {
               </li>
             ))}
           </ol>
+        </ResponseSection>
+      )}
+
+      {!hasTransactions && data.references && data.references.length > 0 && (
+        <ResponseSection icon={FileText} title="Références" bordered>
+          <div className="response-references">
+            {data.references.map((ref, i) => (
+              <span key={i} className="reference-pill">
+                <FileText className="reference-pill__icon" />
+                {formatReference(ref)}
+              </span>
+            ))}
+          </div>
         </ResponseSection>
       )}
 
@@ -116,7 +161,162 @@ export function AIResponseCard({ data }) {
   )
 }
 
+function ResponseBlock({ block }) {
+  if (!block || !block.type) return null
+
+  switch (block.type) {
+    case 'paragraph':
+      return block.content ? (
+        <p className="response-doc-section__paragraph">{block.content}</p>
+      ) : null
+
+    case 'list': {
+      const ListTag = block.style === 'numbered' ? 'ol' : 'ul'
+
+      return block.items && block.items.length > 0 ? (
+        <ListTag className="response-doc-list">
+          {block.items.map((item, index) => (
+            <li key={index}>{item}</li>
+          ))}
+        </ListTag>
+      ) : null
+    }
+
+    case 'table':
+      return <ResponseTable table={block} />
+
+    case 'code':
+      return block.content ? (
+        <pre className="response-doc-code">
+          <code>{block.content}</code>
+        </pre>
+      ) : null
+
+    case 'key_value':
+      return block.items && block.items.length > 0 ? (
+        <KeyValueGrid items={block.items} />
+      ) : null
+
+    case 'callout':
+      return block.content ? <ResponseCallout block={block} /> : null
+
+    default:
+      return null
+  }
+}
+
+function deduplicateBlocks(blocks = []) {
+  const seen = new Set()
+
+  return blocks.filter((block) => {
+    const identity = JSON.stringify(block)
+
+    if (seen.has(identity)) {
+      return false
+    }
+
+    seen.add(identity)
+    return true
+  })
+}
+
+function ResponseTable({ table }) {
+  if (!table?.columns?.length || !table?.rows?.length) return null
+  const rows = deduplicateTableRows(table.rows)
+
+  return (
+    <div className="response-doc-table-wrap">
+      {table.title && <div className="response-doc-table__title">{table.title}</div>}
+      <table className="response-doc-table">
+        <thead>
+          <tr>
+            {table.columns.map((column) => (
+              <th key={column.key}>{column.label}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, rowIndex) => (
+            <tr key={rowIndex}>
+              {table.columns.map((column) => (
+                <td key={column.key}>{row[column.key] ?? ''}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function KeyValueGrid({ items }) {
+  const uniqueItems = deduplicateKeyValueItems(items)
+
+  return (
+    <dl className="response-doc-kv">
+      {uniqueItems.map((item, index) => (
+        <div key={index} className="response-doc-kv__item">
+          <dt>{item.label}</dt>
+          <dd>{item.value}</dd>
+        </div>
+      ))}
+    </dl>
+  )
+}
+
+function deduplicateTableRows(rows = []) {
+  const seen = new Set()
+
+  return rows.filter((row) => {
+    const identity = JSON.stringify(row)
+
+    if (seen.has(identity)) {
+      return false
+    }
+
+    seen.add(identity)
+    return true
+  })
+}
+
+function deduplicateKeyValueItems(items = []) {
+  const seen = new Set()
+
+  return items.filter((item) => {
+    const identity = `${item.label ?? ''}:${item.value ?? ''}`
+
+    if (seen.has(identity)) {
+      return false
+    }
+
+    seen.add(identity)
+    return true
+  })
+}
+
+function ResponseCallout({ block }) {
+  return (
+    <div className={`response-doc-callout response-doc-callout--${block.severity ?? 'info'}`}>
+      {block.title && <div className="response-doc-callout__title">{block.title}</div>}
+      <div className="response-doc-callout__content">{block.content}</div>
+    </div>
+  )
+}
+
+function getDisplayOptions(data) {
+  return {
+    analysis_mode: 'log',
+    show_fields: true,
+    show_log_story: true,
+    show_hsm: false,
+    show_documentation_findings: true,
+    ...(data.display_options ?? {}),
+  }
+}
+
 function TransactionDownloads({ data }) {
+  const displayOptions = getDisplayOptions(data)
+
   const downloadJson = () => {
     downloadTextFile(
       'log-story.json',
@@ -128,7 +328,7 @@ function TransactionDownloads({ data }) {
   const downloadTxt = () => {
     downloadTextFile(
       'log-story.txt',
-      buildLogStoryText(data),
+      buildLogStoryText(data, displayOptions),
       'text/plain',
     )
   }
@@ -138,7 +338,7 @@ function TransactionDownloads({ data }) {
 
     if (!reportWindow) return
 
-    reportWindow.document.write(buildPrintableReport(data))
+    reportWindow.document.write(buildPrintableReport(data, displayOptions))
     reportWindow.document.close()
     reportWindow.focus()
     reportWindow.print()
@@ -164,16 +364,30 @@ function TransactionDownloads({ data }) {
 }
 
 function TransactionCard({ transaction, displayOptions }) {
+  const hsmThread = transaction.hsm_analysis?.thread
+  const hsmOnly = (
+    displayOptions.analysis_mode === 'hsm'
+    || (
+      displayOptions.show_hsm
+      && !displayOptions.show_log_story
+      && !displayOptions.show_fields
+    )
+  )
+
   return (
     <article className="transaction-card">
       <div className="transaction-card__header">
         <div>
           <div className="transaction-card__title">
-            {transaction.display_name ?? transaction.transaction_id ?? 'transaction'}
+            {hsmOnly
+              ? `HSM Analysis #${transaction.log_index ?? 'N/A'}${hsmThread ? ` - Thread ${hsmThread}` : ''}`
+              : transaction.display_name ?? transaction.transaction_id ?? 'transaction'}
           </div>
-          <div className="transaction-card__meta">
-            {transaction.message_type ?? 'Transaction'} - bloc #{transaction.log_index ?? 'N/A'} - MTI {transaction.mti ?? 'UNKNOWN'} - FLD 037 {transaction.fields?.['037'] ?? 'N/A'}
-          </div>
+          {!hsmOnly && (
+            <div className="transaction-card__meta">
+              {transaction.message_type ?? 'Transaction'} - bloc #{transaction.log_index ?? 'N/A'} - MTI {transaction.mti ?? 'UNKNOWN'} - FLD 037 {transaction.fields?.['037'] ?? 'N/A'}
+            </div>
+          )}
         </div>
         <span className={`transaction-status transaction-status--${String(transaction.status ?? 'unknown').toLowerCase()}`}>
           {transaction.status ?? 'UNKNOWN'}
@@ -217,7 +431,9 @@ function FieldGrid({ fields }) {
 }
 
 function HsmAnalysis({ hsm }) {
-  const commands = hsm?.commands ?? []
+  const commands = (hsm?.commands ?? []).filter(
+    (command) => command.request_message || command.hsm_result_code,
+  )
 
   if (!hsm || commands.length === 0) return null
 
@@ -225,9 +441,6 @@ function HsmAnalysis({ hsm }) {
     <div className="transaction-section hsm-analysis">
       <div className="hsm-analysis__header">
         <h5 className="transaction-section__title">HSM Analysis</h5>
-        {hsm.thread && (
-          <span className="hsm-analysis__thread">Thread {hsm.thread}</span>
-        )}
       </div>
       <div className="hsm-analysis__list">
         {commands.map((command, index) => (
@@ -253,39 +466,29 @@ function HsmCommandCard({ command }) {
   return (
     <div className="hsm-command">
       <div className="hsm-command__top">
-        <div className="hsm-command__codes">
-          <span>
-            <b>Command</b>
-            {command.command || 'N/A'}
-          </span>
-          <span>
-            <b>Response</b>
-            {command.response_command || 'N/A'}
-          </span>
-          <span>
-            <b>HsmResultCode</b>
-            {command.hsm_result_code || 'N/A'}
-          </span>
-          <span>
-            <b>Code retour</b>
-            {command.return_code || 'N/A'}
-          </span>
-        </div>
         <span className={`log-story__status log-story__status--${String(command.status ?? 'unknown').toLowerCase()}`}>
           {command.status ?? 'UNKNOWN'}
         </span>
       </div>
 
       <div className="hsm-command__details">
-        <HsmDetail label="Nom de la commande" value={command.command_name} />
-        <HsmDetail label="Description de la commande" value={command.command_description} multiline />
         <HsmDetail label="Message envoye (TO HSM)" value={command.request_message} mono />
+        <HsmDetail label="Thread" value={command.thread} />
+        <HsmDetail label="Commande" value={command.command ? `command_${command.command}` : ''} />
         <HsmDetail label="Reponse HSM" value={command.response_command} />
-        <HsmDetail label="Message recu (FROM HSM)" value={command.response_message} mono />
-        <HsmDetail label="Signification du code retour" value={command.return_code_meaning} multiline />
-        <HsmDetail label="Resultat fonctionnel" value={command.functional_result} />
-        <HsmDetail label="Interpretation technique" value={command.technical_interpretation} multiline />
-        <div className="hsm-command__detail hsm-command__detail--full">
+        <HsmDetail label="Code retour" value={command.return_code} />
+        <HsmDetail label="HsmResultCode" value={command.hsm_result_code} />
+        {/* <HsmDetail
+          label="Description"
+          value={
+            meaningfulHsmDescription(command.return_code_meaning)
+            || meaningfulHsmDescription(command.command_description)
+            || command.trace_description
+            || command.detected_status
+          }
+          multiline
+        /> */}
+        {/* <div className="hsm-command__detail hsm-command__detail--full">
           <b>References documentaires</b>
           {uniqueReferences.length > 0 ? (
             <div className="hsm-command__references">
@@ -296,9 +499,55 @@ function HsmCommandCard({ command }) {
           ) : (
             <p>Non trouve dans la documentation fournie</p>
           )}
-        </div>
+        </div> */}
       </div>
     </div>
+  )
+}
+
+function formatReference(ref) {
+  const parts = [ref.source ?? 'Document']
+
+  if (ref.section || ref.heading) {
+    parts.push(ref.section ?? ref.heading)
+  }
+
+  if (ref.printed_page) {
+    parts.push(`page imprimee ${ref.printed_page}`)
+  }
+
+  if (ref.pdf_page !== undefined && ref.pdf_page !== null) {
+    parts.push(`page PDF ${ref.pdf_page}`)
+  } else if (ref.page !== undefined && ref.page !== null) {
+    parts.push(`page PDF ${ref.page}`)
+  }
+
+  if (ref.sheet) {
+    parts.push(ref.sheet)
+  }
+
+  if (ref.paragraph !== undefined && ref.paragraph !== null) {
+    parts.push(`para. ${ref.paragraph}`)
+  }
+
+  return parts.join(' - ')
+}
+
+function meaningfulHsmDescription(value) {
+  if (!value) return ''
+
+  return String(value).includes('Non trouve dans la documentation')
+    ? ''
+    : value
+}
+
+function hsmDescription(command) {
+  return (
+    meaningfulHsmDescription(command.return_code_meaning)
+    || meaningfulHsmDescription(command.command_description)
+    || command.trace_description
+    || command.detected_status
+    || 'Non trouve dans la documentation fournie'
   )
 }
 
@@ -412,9 +661,13 @@ function DocumentationFindings({ findings }) {
         {visibleFindings.map((finding, index) => (
           <div key={index} className="doc-finding">
             <strong>{finding.anomaly ?? finding.title ?? 'Anomaly justification'}</strong>
-            {finding.observed_value && <p>Observed: {finding.observed_value}</p>}
-            {finding.expected_rule && <p>Expected rule: {finding.expected_rule}</p>}
+            {finding.field && <p>Champ: {finding.field}</p>}
+            {finding.observed_value && <p>Valeur observee: {finding.observed_value}</p>}
+            {finding.expected_condition && <p>Condition attendue: {finding.expected_condition}</p>}
+            {finding.context && <p>Contexte: {finding.context}</p>}
+            {finding.expected_rule && <p>Regle documentaire: {finding.expected_rule}</p>}
             {finding.explanation && <p>{finding.explanation}</p>}
+            {finding.conclusion && <p>{finding.conclusion}</p>}
             {(finding.source || finding.page || finding.paragraph) && (
               <p>
                 Source: {finding.source ?? 'PDF'}
@@ -469,7 +722,7 @@ function downloadTextFile(filename, content, type) {
   URL.revokeObjectURL(url)
 }
 
-function buildLogStoryText(data) {
+function buildLogStoryText(data, displayOptions = getDisplayOptions(data)) {
   const lines = [data.summary ?? '', '']
 
   for (const transaction of data.transactions ?? []) {
@@ -478,18 +731,19 @@ function buildLogStoryText(data) {
     if (transaction.hsm_analysis?.commands?.length) {
       lines.push(`HSM Thread=${transaction.hsm_analysis.thread || 'N/A'}`)
       for (const command of transaction.hsm_analysis.commands) {
-        lines.push(`HSM ${command.command || 'N/A'} -> ${command.response_command || 'N/A'} | HsmResultCode=${command.hsm_result_code || 'N/A'} | ReturnCode=${command.return_code || 'N/A'} | ${command.status || 'UNKNOWN'}`)
-        lines.push(`CommandName=${command.command_name || 'Non trouve dans la documentation fournie'}`)
-        lines.push(`CommandDescription=${command.command_description || 'Non trouve dans la documentation fournie'}`)
+        lines.push(`Thread=${command.thread || transaction.hsm_analysis.thread || 'N/A'}`)
         if (command.request_message) lines.push(`TO HSM=${command.request_message}`)
-        if (command.response_message) lines.push(`FROM HSM=${command.response_message}`)
-        lines.push(`ReturnCodeMeaning=${command.return_code_meaning || 'Non trouve dans la documentation fournie'}`)
-        lines.push(`FunctionalResult=${command.functional_result || 'UNKNOWN'}`)
-        lines.push(`TechnicalInterpretation=${command.technical_interpretation || 'Non trouve dans la documentation fournie'}`)
+        lines.push(`Commande=command_${command.command || 'N/A'}`)
+        lines.push(`Reponse HSM=${command.response_command || 'N/A'}`)
+        lines.push(`Code retour=${command.return_code || 'N/A'}`)
+        // lines.push(`HsmResultCode=${command.hsm_result_code || 'N/A'}`)
+        lines.push(`Description=${hsmDescription(command)}`)
       }
     }
-    for (const item of transaction.log_story ?? []) {
-      lines.push(`${String(item.order).padStart(3, '0')} ${item.function_name} ${item.status}`)
+    if (displayOptions.show_log_story) {
+      for (const item of transaction.log_story ?? []) {
+        lines.push(`${String(item.order).padStart(3, '0')} ${item.function_name} ${item.status}`)
+      }
     }
     lines.push('')
   }
@@ -506,13 +760,13 @@ function escapeHtml(value) {
     .replace(/'/g, '&#039;')
 }
 
-function buildPrintableReport(data) {
+function buildPrintableReport(data, displayOptions = getDisplayOptions(data)) {
   const transactionHtml = (data.transactions ?? []).map((transaction) => {
     const fields = transaction.fields ?? {}
     const hsmRows = (transaction.hsm_analysis?.commands ?? []).map((command) => `
       <tr>
         <td>${escapeHtml(command.thread ?? transaction.hsm_analysis?.thread ?? 'N/A')}</td>
-        <td>${escapeHtml(command.command ?? 'N/A')}</td>
+        <td>${escapeHtml(command.command ? `command_${command.command}` : 'N/A')}</td>
         <td>${escapeHtml(command.response_command ?? 'N/A')}</td>
         <td>${escapeHtml(command.hsm_result_code ?? 'N/A')}</td>
         <td>${escapeHtml(command.return_code ?? 'N/A')}</td>
@@ -520,13 +774,9 @@ function buildPrintableReport(data) {
       </tr>
       <tr>
         <td colspan="6">
-          <b>Nom:</b> ${escapeHtml(command.command_name ?? 'Non trouve dans la documentation fournie')}<br>
-          <b>Description:</b> ${escapeHtml(command.command_description ?? 'Non trouve dans la documentation fournie')}<br>
           <b>TO HSM:</b> ${escapeHtml(command.request_message ?? 'N/A')}<br>
-          <b>FROM HSM:</b> ${escapeHtml(command.response_message ?? 'N/A')}<br>
-          <b>Signification:</b> ${escapeHtml(command.return_code_meaning ?? 'Non trouve dans la documentation fournie')}<br>
-          <b>Resultat:</b> ${escapeHtml(command.functional_result ?? 'UNKNOWN')}<br>
-          <b>Interpretation:</b> ${escapeHtml(command.technical_interpretation ?? 'Non trouve dans la documentation fournie')}
+          <b>Thread:</b> ${escapeHtml(command.thread ?? transaction.hsm_analysis?.thread ?? 'N/A')}<br>
+          <b>Description:</b> ${escapeHtml(hsmDescription(command))}
         </td>
       </tr>
     `).join('')
@@ -559,16 +809,18 @@ function buildPrintableReport(data) {
         </div>
         ${hsmRows ? `
           <h3>HSM Analysis</h3>
+          // <table>
+          //   <thead><tr><th>Thread</th><th>Command</th><th>Response</th><th>HsmResultCode</th><th>Return Code</th><th>Status</th></tr></thead>
+          //   <tbody>${hsmRows}</tbody>
+          // </table>
+        ` : ''}
+        ${displayOptions.show_log_story ? `
+          <h3>Log Story</h3>
           <table>
-            <thead><tr><th>Thread</th><th>Command</th><th>Response</th><th>HsmResultCode</th><th>Return Code</th><th>Status</th></tr></thead>
-            <tbody>${hsmRows}</tbody>
+            <thead><tr><th>#</th><th>Function</th><th>Status</th></tr></thead>
+            <tbody>${storyRows}</tbody>
           </table>
         ` : ''}
-        <h3>Log Story</h3>
-        <table>
-          <thead><tr><th>#</th><th>Function</th><th>Status</th></tr></thead>
-          <tbody>${storyRows}</tbody>
-        </table>
         ${facts ? `<h3>Observed Facts</h3><ul>${facts}</ul>` : ''}
         ${findings ? `<h3>Documentation Findings</h3><ul>${findings}</ul>` : ''}
       </section>

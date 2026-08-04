@@ -19,6 +19,11 @@ from app.services.document_service import (
     # reindex_document,
     serialize_document,
 )
+from app.services.file_type_service import (
+    TRACE_TEXT_EXTENSIONS,
+    is_trace_extension,
+    with_trace_extension_query,
+)
 from app.services.log_analysis_agent_service import (
     apply_deterministic_enrichment,
     enrich_transactions_with_documentation,
@@ -37,7 +42,7 @@ router = APIRouter(
 )
 
 
-LOG_EXTENSIONS = {".txt", ".log"}
+LOG_EXTENSIONS = TRACE_TEXT_EXTENSIONS
 INLINE_MEDIA_TYPES = {
     ".pdf": "application/pdf",
     ".txt": "text/plain; charset=utf-8",
@@ -129,7 +134,7 @@ def document_kind(
 ) -> str:
     extension = document.get("extension")
 
-    if extension in LOG_EXTENSIONS:
+    if is_trace_extension(extension):
         return "trace"
 
     if extension == ".xlsx":
@@ -148,12 +153,12 @@ def summarize_block(
     traces = [
         document
         for document in documents
-        if document.get("extension") in LOG_EXTENSIONS
+        if is_trace_extension(document.get("extension"))
     ]
     references = [
         document
         for document in documents
-        if document.get("extension") not in LOG_EXTENSIONS
+        if not is_trace_extension(document.get("extension"))
     ]
     failed_documents = [
         document
@@ -196,7 +201,7 @@ async def admin_documents(
         normalized_type = type.lower()
 
         if normalized_type == "trace":
-            query["extension"] = {"$in": list(LOG_EXTENSIONS)}
+            query = with_trace_extension_query(query)
         elif normalized_type in {"pdf", "xlsx", "docx"}:
             query["extension"] = f".{normalized_type}"
 
@@ -304,13 +309,19 @@ async def admin_view_document(
             detail="Stored file not found.",
         )
 
+    extension = document.get("extension")
+    media_type = (
+        "text/plain; charset=utf-8"
+        if is_trace_extension(extension)
+        else INLINE_MEDIA_TYPES.get(
+            extension,
+            document.get("content_type") or "application/octet-stream",
+        )
+    )
     response = FileResponse(
         path=file_path,
         filename=document["original_filename"],
-        media_type=INLINE_MEDIA_TYPES.get(
-            document.get("extension"),
-            document.get("content_type") or "application/octet-stream",
-        ),
+        media_type=media_type,
     )
     response.headers["Content-Disposition"] = (
         f'inline; filename="{document["original_filename"]}"'
@@ -452,7 +463,7 @@ async def admin_preview_document(
         workbook.close()
         return HTMLResponse(html)
 
-    if extension in LOG_EXTENSIONS:
+    if is_trace_extension(extension):
         preview_text = read_stored_text_document(document)
         subtitle = "Stored file preview"
     else:
@@ -633,10 +644,10 @@ async def build_admin_log_story(
             detail="Document not found.",
         )
 
-    if document.get("extension") not in LOG_EXTENSIONS:
+    if not is_trace_extension(document.get("extension")):
         raise HTTPException(
             status_code=400,
-            detail="Log Story is available only for .txt/.log files.",
+            detail="Log Story is available only for trace text files.",
         )
 
     text = read_stored_text_document(document)
