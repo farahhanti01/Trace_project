@@ -2663,6 +2663,7 @@ class KnowledgeGenerationPipeline:
             if repair_validation_errors:
                 payload["_validation_errors_after_repair"] = repair_validation_errors
 
+        payload = unwrap_nested_response_payload(payload)
         payload["_knowledge"] = knowledge
         payload["_plan"] = plan
         payload["_extraction_validation_errors"] = extraction_errors

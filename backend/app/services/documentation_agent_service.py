@@ -1,5 +1,7 @@
 import json
+import logging
 import re
+import time
 import unicodedata
 from typing import Any
 
@@ -27,7 +29,24 @@ from app.services.documentation_synthesis_service import (
     question_requests_table,
     source_ids_from_rows,
 )
+from app.services.documentation_evidence_generation_service import (
+    evidence_generation_enabled,
+    evidence_shadow_enabled,
+    evidence_table_lookup_generation_enabled,
+    shadow_evidence_response,
+    try_generate_evidence_response,
+    try_generate_table_lookup_response,
+)
+from app.services.conversation_memory_service import (
+    resolve_documentation_query,
+    update_documentation_memory,
+)
+from app.services.file_type_service import REFERENCE_DOCUMENT_EXTENSIONS
+from app.services.function_catalog_service import answer_function_question
+from app.services.screenshot_analysis_service import answer_screenshot_question
 
+
+logger = logging.getLogger(__name__)
 
 MAX_CONTEXT_CHARACTERS = 22_000
 MAX_SELECTED_SECTIONS = 8
@@ -982,6 +1001,25 @@ def unwrap_nested_agent_payload(
     return payload
 
 
+def unwrap_repeated_nested_agent_payload(
+    payload: dict[str, Any],
+    max_depth: int = 3,
+) -> dict[str, Any]:
+    """Applique le deballage plusieurs fois pour eviter le JSON doublement encode."""
+
+    current = payload
+
+    for _ in range(max_depth):
+        unwrapped = unwrap_nested_agent_payload(current)
+
+        if unwrapped == current:
+            return unwrapped
+
+        current = unwrapped
+
+    return current
+
+
 def should_repair_atomic_story(
     payload: dict[str, Any],
 ) -> bool:
@@ -1322,6 +1360,7 @@ def reference_from_section(
     return {
         "source": display_source_name(section["source"]),
         "original_source": section["source"],
+        "document_id": str(section.get("document_id") or ""),
         "page": section.get("page"),
         "pdf_page": section.get("page"),
         "printed_page": section.get("page_document"),
@@ -2271,7 +2310,7 @@ def normalize_agent_response(
     question: str = "",
 ) -> dict[str, Any]:
     """Normalise la reponse du modele vers le schema attendu par le frontend."""
-    payload = unwrap_nested_agent_payload(payload)
+    payload = unwrap_repeated_nested_agent_payload(payload)
     references = payload.get("references")
     answer_sections = normalize_answer_sections(
         payload=payload,
@@ -2583,9 +2622,8 @@ async def load_sections(
         documents = await documents_collection.find(
             {
                 "_id": {"$in": object_ids},
-                "conversation_id": conversation_id,
                 "status": "extracted",
-                "extension": {"$in": [".pdf", ".docx", ".xlsx"]},
+                "extension": {"$in": sorted(REFERENCE_DOCUMENT_EXTENSIONS)},
             }
         ).to_list(length=100)
     else:
@@ -2595,7 +2633,7 @@ async def load_sections(
         }
 
         if include_all_agents:
-            query["extension"] = {"$in": [".pdf", ".docx", ".xlsx"]}
+            query["extension"] = {"$in": sorted(REFERENCE_DOCUMENT_EXTENSIONS)}
         else:
             query["agent"] = "documentation"
 
@@ -2639,6 +2677,8 @@ async def load_sections(
             continue
 
         enriched_sections.append({
+            "document_id": section.get("document_id"),
+            "source_section_id": str(section.get("_id")),
             "source": document["original_filename"],
             "text": section.get("text", ""),
             "page": section.get("page"),
@@ -2783,13 +2823,104 @@ async def answer_documentation_question(
     conversation_id: str | None,
     referenced_document_ids: list[str] | None = None,
     include_all_agents: bool = False,
+    force_legacy: bool = False,
 ) -> dict[str, Any]:
     """Pipeline principal du Documentation Agent: RAG, prompt, normalisation."""
+    legacy_started = time.perf_counter()
+    effective_question = question
+    memory_resolution = None
+    memory_state = None
+
     if not conversation_id:
         raise HTTPException(
             status_code=400,
             detail="A conversation_id is required for Documentation Agent.",
         )
+
+    try:
+        memory_resolution, memory_state, _recent_messages = await resolve_documentation_query(
+            question=question,
+            conversation_id=conversation_id,
+        )
+        effective_question = memory_resolution.resolved_query
+    except Exception as error:
+        logger.info("MEMORY_RESOLUTION_ERROR %s", error)
+
+    if (
+        memory_resolution
+        and memory_resolution.query_type == "CONVERSATION_RECALL"
+    ):
+        if memory_resolution.recall_answer:
+            await update_documentation_memory(
+                conversation_id=conversation_id,
+                state=memory_state,
+                resolved=memory_resolution,
+                referenced_document_ids=referenced_document_ids,
+            )
+            return {
+                "summary": memory_resolution.recall_answer,
+                "sections": [],
+                "story": [],
+                "issues": [],
+                "recommendations": [],
+                "references": [],
+            }
+
+        return {
+            "summary": (
+                "Je n'ai pas assez de contexte fiable pour identifier le "
+                "sujet precedent. Peux-tu preciser le Field, le message ou "
+                "le concept concerne ?"
+            ),
+            "sections": [],
+            "story": [],
+            "issues": [
+                {
+                    "severity": "warning",
+                    "title": "Contexte conversationnel ambigu",
+                    "detail": memory_resolution.ambiguity_reason
+                    or "CONVERSATION_CONTEXT_AMBIGUOUS",
+                }
+            ],
+            "recommendations": [],
+            "references": [],
+        }
+
+    screenshot_response = await answer_screenshot_question(
+        question=effective_question,
+        conversation_id=conversation_id,
+        referenced_document_ids=referenced_document_ids,
+        agent="documentation",
+    )
+
+    if screenshot_response is not None:
+        await update_documentation_memory(
+            conversation_id=conversation_id,
+            state=memory_state,
+            resolved=memory_resolution,
+            referenced_document_ids=referenced_document_ids,
+        )
+        return screenshot_response
+
+    try:
+        function_response = await answer_function_question(
+            question=effective_question,
+            original_question=question,
+            conversation_id=conversation_id,
+            referenced_document_ids=referenced_document_ids,
+            memory_resolution=memory_resolution,
+        )
+
+        if function_response is not None:
+            await update_documentation_memory(
+                conversation_id=conversation_id,
+                state=memory_state,
+                resolved=memory_resolution,
+                referenced_document_ids=referenced_document_ids,
+            )
+            return function_response
+    except Exception as error:
+        logger.info("FUNCTION_CATALOG_FALLBACK reason=%s", error)
 
     sections = await load_sections(
         conversation_id,
@@ -2801,8 +2932,8 @@ async def answer_documentation_question(
         return {
             "summary": (
                 "Aucun document extrait n'est disponible pour cette "
-                "conversation. Ajoute un document PDF, DOCX, XLSX, TXT "
-                "ou LOG, puis repose ta question."
+                "conversation. Ajoute un document PDF, DOCX, XLSX, TXT, "
+                "LOG ou une capture d'ecran, puis repose ta question."
             ),
             "story": [],
             "issues": [
@@ -2822,8 +2953,55 @@ async def answer_documentation_question(
             "references": [],
         }
 
-    retrieval_question = expand_documentation_question(question)
-    intent = classify_intent(question)
+    if (
+        evidence_table_lookup_generation_enabled()
+        and not force_legacy
+    ):
+        try:
+            table_response = await try_generate_table_lookup_response(
+                question=effective_question,
+                sections=sections,
+                original_question=question,
+                conversation_id=conversation_id,
+                memory_resolution=memory_resolution,
+            )
+            await update_documentation_memory(
+                conversation_id=conversation_id,
+                state=memory_state,
+                resolved=memory_resolution,
+                referenced_document_ids=referenced_document_ids,
+            )
+            return table_response
+        except Exception as error:
+            logger.info(
+                "EVIDENCE_TABLE_LOOKUP_FALLBACK reason=%s",
+                error,
+            )
+
+    if evidence_generation_enabled() and not force_legacy:
+        try:
+            evidence_response = await try_generate_evidence_response(
+                question=effective_question,
+                sections=sections,
+                original_question=question,
+                conversation_id=conversation_id,
+                memory_resolution=memory_resolution,
+            )
+            await update_documentation_memory(
+                conversation_id=conversation_id,
+                state=memory_state,
+                resolved=memory_resolution,
+                referenced_document_ids=referenced_document_ids,
+            )
+            return evidence_response
+        except Exception as error:
+            logger.info(
+                "EVIDENCE_PIPELINE_FALLBACK reason=%s",
+                error,
+            )
+
+    retrieval_question = expand_documentation_question(effective_question)
+    intent = classify_intent(effective_question)
     overview_mode = intent == DOCUMENT_OVERVIEW
     field_mode = intent in {ISO_FIELD_EXPLANATION, ISO_VALUE_DECODING}
 
@@ -2880,7 +3058,7 @@ async def answer_documentation_question(
 
     try:
         payload = await KnowledgeGenerationPipeline.generate(
-            question=question,
+            question=effective_question,
             intent=intent,
             context=context,
             selected_sections=selected_sections,
@@ -2898,10 +3076,59 @@ async def answer_documentation_question(
             question=retrieval_question,
         )
 
-    return normalize_agent_response(
+    response = normalize_agent_response(
         payload=payload,
         selected_sections=selected_sections,
         enforce_story_sources=True,
         evidence=evidence,
         question=retrieval_question,
     )
+
+    await update_documentation_memory(
+        conversation_id=conversation_id,
+        state=memory_state,
+        resolved=memory_resolution,
+        referenced_document_ids=referenced_document_ids,
+    )
+
+    if evidence_shadow_enabled() and not force_legacy:
+        shadow = await shadow_evidence_response(
+            question=effective_question,
+            sections=sections,
+            original_question=question,
+            conversation_id=conversation_id,
+            memory_resolution=memory_resolution,
+        )
+        comparison_payload = {
+            "question": question,
+            "resolved_question": effective_question,
+            "memory_resolution": (
+                memory_resolution.model_dump()
+                if memory_resolution
+                else None
+            ),
+            "old_response": response,
+            "evidence_response": shadow.get("response"),
+            "intent": shadow.get("intent"),
+            "answer_requirements": shadow.get("answer_requirements"),
+            "retrieval_complete": shadow.get("retrieval_complete"),
+            "validation": shadow.get("validation"),
+            "evidence_bundle": shadow.get("evidence_bundle"),
+            "latency_old_ms": round(
+                (time.perf_counter() - legacy_started) * 1000
+            ),
+            "latency_evidence_ms": shadow.get("latency_ms"),
+            "latency_evidence": shadow.get("latency"),
+            "error": shadow.get("error"),
+            "fallback_reason": shadow.get("fallback_reason"),
+        }
+        logger.info(
+            "EVIDENCE_PIPELINE_SHADOW_RESULT %s",
+            json.dumps(
+                comparison_payload,
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
+
+    return response

@@ -32,14 +32,8 @@ Ouvrir un deuxieme terminal VS Code.
 cd backend
 source .venv/Scripts/activate
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
 
-### Si le terminal est PowerShell
-
-```powershell
-cd backend
-.\.venv\Scripts\Activate.ps1
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 Backend :
@@ -110,3 +104,9 @@ cd frontend
 npm install
 ```
 
+
+
+#pour le 
+docker run -d --name trace-mongo-express -p 8081:8081 -e ME_CONFIG_MONGODB_URL="mongodb://trace:trace123@host.docker.internal:27017/?authSource=admin" -e ME_CONFIG_BASICAUTH=false mongo-express
+
+Puis ouvre "http://localhost:8081"

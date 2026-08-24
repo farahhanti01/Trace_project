@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Any
 from html import escape
@@ -10,6 +11,7 @@ from openpyxl import load_workbook
 
 from app.database import (
     conversations_collection,
+    document_facts_collection,
     document_sections_collection,
     documents_collection,
 )
@@ -21,6 +23,7 @@ from app.services.document_service import (
 )
 from app.services.file_type_service import (
     TRACE_TEXT_EXTENSIONS,
+    is_image_extension,
     is_trace_extension,
     with_trace_extension_query,
 )
@@ -45,6 +48,13 @@ router = APIRouter(
 LOG_EXTENSIONS = TRACE_TEXT_EXTENSIONS
 INLINE_MEDIA_TYPES = {
     ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
     ".txt": "text/plain; charset=utf-8",
     ".log": "text/plain; charset=utf-8",
     ".docx": (
@@ -142,6 +152,9 @@ def document_kind(
 
     if extension == ".pdf":
         return "pdf"
+
+    if is_image_extension(extension):
+        return "image"
 
     return "document"
 
@@ -328,6 +341,159 @@ async def admin_view_document(
     )
 
     return response
+
+
+def search_pdf_highlight_rects(
+    page: fitz.Page,
+    search: str,
+) -> list[fitz.Rect]:
+    search_terms = []
+    cleaned = re.sub(r"\s+", " ", search or "").strip()
+
+    if cleaned:
+        search_terms.append(cleaned)
+
+        if ":" in cleaned:
+            search_terms.append(cleaned.split(":", 1)[1].strip())
+
+        search_terms.append(cleaned.replace("'", "").replace('"', ""))
+
+    seen = set()
+    rects = []
+
+    for term in search_terms:
+        if not term:
+            continue
+
+        for rect in page.search_for(term):
+            identity = tuple(round(value, 2) for value in rect)
+
+            if identity in seen:
+                continue
+
+            seen.add(identity)
+            rects.append(rect)
+
+        if rects:
+            break
+
+    return rects
+
+
+@router.get("/documents/{document_id}/page-preview")
+async def admin_preview_pdf_page(
+    document_id: str,
+    page: int = 1,
+    search: str = "",
+):
+    document = await get_document(document_id)
+
+    if document is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found.",
+        )
+
+    if document.get("extension") != ".pdf":
+        raise HTTPException(
+            status_code=400,
+            detail="Preview is only available for PDF documents.",
+        )
+
+    file_path = BACKEND_ROOT / document["relative_path"]
+
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Stored file not found.",
+        )
+
+    with fitz.open(file_path) as pdf:
+        if pdf.page_count == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="PDF has no pages.",
+            )
+
+        page_index = min(max(page, 1), pdf.page_count) - 1
+        pdf_page = pdf.load_page(page_index)
+
+        for rect in search_pdf_highlight_rects(pdf_page, search):
+            annotation = pdf_page.add_highlight_annot(rect)
+            annotation.set_colors(stroke=(1, 0.9, 0.12))
+            annotation.update()
+
+        pixmap = pdf_page.get_pixmap(
+            matrix=fitz.Matrix(1.25, 1.25),
+            alpha=False,
+            annots=True,
+        )
+
+    return Response(
+        content=pixmap.tobytes("png"),
+        media_type="image/png",
+        headers={
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.get("/documents/{document_id}/highlighted-view")
+async def admin_view_highlighted_pdf(
+    document_id: str,
+    page: int = 1,
+    search: str = "",
+):
+    document = await get_document(document_id)
+
+    if document is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found.",
+        )
+
+    if document.get("extension") != ".pdf":
+        raise HTTPException(
+            status_code=400,
+            detail="Highlighted view is only available for PDF documents.",
+        )
+
+    file_path = BACKEND_ROOT / document["relative_path"]
+
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Stored file not found.",
+        )
+
+    with fitz.open(file_path) as pdf:
+        if pdf.page_count == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="PDF has no pages.",
+            )
+
+        page_index = min(max(page, 1), pdf.page_count) - 1
+        pdf_page = pdf.load_page(page_index)
+
+        for rect in search_pdf_highlight_rects(pdf_page, search):
+            annotation = pdf_page.add_highlight_annot(rect)
+            annotation.set_colors(stroke=(1, 0.9, 0.12))
+            annotation.update()
+
+        pdf_bytes = pdf.tobytes(
+            garbage=4,
+            deflate=True,
+        )
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{document["original_filename"]}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.get("/documents/{document_id}/preview")
@@ -561,6 +727,11 @@ async def admin_delete_document(
 
     await documents_collection.delete_one({"_id": object_id})
     await document_sections_collection.delete_many(
+        {
+            "document_id": document_id,
+        }
+    )
+    await document_facts_collection.delete_many(
         {
             "document_id": document_id,
         }

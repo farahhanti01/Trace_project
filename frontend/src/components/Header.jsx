@@ -26,12 +26,12 @@ export default function Header({
           <PanelLeft size={21} />
         </button>
 
-        <div className="topbar-title">
-          TRACE AI Platform
-        </div>
+        {/* <div className="topbar-title">
+          TRACE Platform
+        </div> */}
       </div>
 
-      <div className="topbar-profile">
+      {/* <div className="topbar-profile">
         <div className="topbar-user">
           <span className="topbar-user__name">
             Farah HANTI
@@ -45,7 +45,7 @@ export default function Header({
         <div className="topbar-avatar">
           FH
         </div>
-      </div>
+      </div> */}
     </header>
   );
 }

@@ -9,6 +9,7 @@ from bson import ObjectId
 from fastapi import HTTPException
 
 from app.database import (
+    document_facts_collection,
     document_sections_collection,
     documents_collection,
     messages_collection,
@@ -35,6 +36,7 @@ from app.services.retrieval_service import (
     extract_relevant_excerpt,
     select_relevant_sections,
 )
+from app.services.screenshot_analysis_service import answer_screenshot_question
 
 
 MAX_PDF_REFERENCE_SECTIONS = 4
@@ -43,6 +45,19 @@ MAX_LLM_TRANSACTIONS = 8
 MAX_RESPONSE_TRANSACTIONS = 30
 MAX_DOCUMENTATION_FINDINGS = 3
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
+HSM_DOCUMENT_SOURCE_TERMS = (
+    "core host commands",
+    "pugd",
+    "thales",
+    "hsm",
+)
+HSM_DOCUMENT_TEXT_TERMS = (
+    "response message",
+    "host command",
+    "to hsm",
+    "from hsm",
+    "error code",
+)
 LOG_ANALYSIS_USE_LLM = os.getenv(
     "LOG_ANALYSIS_USE_LLM",
     "false",
@@ -189,6 +204,21 @@ def valid_object_ids(
     ]
 
 
+def extracted_trace_document_query(
+    conversation_id: str,
+    object_ids: list[ObjectId] | None = None,
+) -> dict[str, Any]:
+    query = {
+        "conversation_id": conversation_id,
+        "status": "extracted",
+    }
+
+    if object_ids:
+        query["_id"] = {"$in": object_ids}
+
+    return with_trace_extension_query(query)
+
+
 async def document_ids_containing_logs(
     conversation_id: str,
     document_ids: list[str],
@@ -199,12 +229,10 @@ async def document_ids_containing_logs(
         return []
 
     documents = await documents_collection.find(
-        with_trace_extension_query({
-            "_id": {"$in": object_ids},
-            "conversation_id": conversation_id,
-            "agent": "log",
-            "status": "extracted",
-        })
+        extracted_trace_document_query(
+            conversation_id=conversation_id,
+            object_ids=object_ids,
+        )
     ).to_list(length=50)
 
     return [
@@ -269,21 +297,16 @@ async def load_log_documents(
     referenced_document_ids: list[str],
 ) -> list[dict[str, Any]]:
     object_ids = valid_object_ids(referenced_document_ids)
-    base_query = {
-        "conversation_id": conversation_id,
-        "agent": "log",
-        "status": "extracted",
-    }
-    base_query = with_trace_extension_query(base_query)
+    base_query = extracted_trace_document_query(
+        conversation_id=conversation_id,
+    )
 
     if object_ids:
         referenced_logs = await documents_collection.find(
-            with_trace_extension_query({
-                "_id": {"$in": object_ids},
-                "conversation_id": conversation_id,
-                "agent": "log",
-                "status": "extracted",
-            })
+            extracted_trace_document_query(
+                conversation_id=conversation_id,
+                object_ids=object_ids,
+            )
         ).sort(
             "created_at",
             1,
@@ -347,12 +370,22 @@ async def load_reference_sections(
     referenced_document_ids: list[str],
 ) -> list[dict[str, Any]]:
     object_ids = valid_object_ids(referenced_document_ids)
+    query = {
+        "conversation_id": conversation_id,
+        "status": "extracted",
+        "extension": {"$in": [".pdf", ".xlsx"]},
+    }
+    conversation_documents = await documents_collection.find(
+        query
+    ).sort(
+        "created_at",
+        1,
+    ).to_list(length=100)
 
     if object_ids:
         referenced_documents = await documents_collection.find(
             {
                 "_id": {"$in": object_ids},
-                "conversation_id": conversation_id,
                 "status": "extracted",
                 "extension": {"$in": [".pdf", ".xlsx"]},
             }
@@ -363,29 +396,18 @@ async def load_reference_sections(
                 str(document["_id"])
                 for document in referenced_documents
             }
-            conversation_xlsx = await documents_collection.find(
-                {
-                    "conversation_id": conversation_id,
-                    "status": "extracted",
-                    "extension": ".xlsx",
-                    "_id": {"$nin": valid_object_ids(list(referenced_ids))},
-                }
-            ).to_list(length=100)
+            remaining_documents = [
+                document
+                for document in conversation_documents
+                if str(document["_id"]) not in referenced_ids
+            ]
 
             return await load_sections_for_documents([
                 *referenced_documents,
-                *conversation_xlsx,
+                *remaining_documents,
             ])
 
-    query = {
-        "conversation_id": conversation_id,
-        "status": "extracted",
-        "extension": {"$in": [".pdf", ".xlsx"]},
-    }
-
-    documents = await documents_collection.find(query).to_list(length=100)
-
-    return await load_sections_for_documents(documents)
+    return await load_sections_for_documents(conversation_documents)
 
 
 def group_log_texts_by_source(
@@ -572,7 +594,21 @@ def display_options_for_question(
     question: str,
 ) -> dict[str, bool]:
     normalized = normalize_question_text(question)
-    wants_total = any(term in normalized for term in TOTAL_ANALYSIS_TERMS)
+    wants_generic_trace_analysis = any(
+        term in normalized
+        for term in (
+            "analyse cette trace",
+            "analyse la trace",
+            "analyse ce log",
+            "analyse le log",
+            "analyze this trace",
+            "analyze the trace",
+        )
+    )
+    wants_total = (
+        any(term in normalized for term in TOTAL_ANALYSIS_TERMS)
+        or wants_generic_trace_analysis
+    )
     wants_hsm = any(term in normalized for term in HSM_ANALYSIS_TERMS)
     wants_log_story = any(term in normalized for term in LOG_STORY_TERMS)
     only_hsm = (
@@ -774,6 +810,292 @@ def transaction_matches_constraints(
     return True
 
 
+def transaction_has_visible_analysis(
+    transaction: dict[str, Any],
+) -> bool:
+    return bool(transaction.get("log_story")) or bool(
+        (transaction.get("hsm_analysis") or {}).get("commands")
+    )
+
+
+def transaction_group_key(
+    transaction: dict[str, Any],
+) -> tuple[str, str]:
+    fields = transaction.get("fields") or {}
+    rrn = fields.get("037")
+
+    if rrn:
+        return (
+            str(transaction.get("source") or ""),
+            f"rrn:{rrn}",
+        )
+
+    return (
+        str(transaction.get("source") or ""),
+        f"transaction:{transaction.get('transaction_id') or id(transaction)}",
+    )
+
+
+def severity_rank(
+    status: str | None,
+) -> int:
+    return {
+        "FAILED": 4,
+        "ERROR": 4,
+        "WARNING": 3,
+        "UNKNOWN": 2,
+        "SUCCESS": 1,
+    }.get(str(status or "UNKNOWN").upper(), 2)
+
+
+def strongest_status(
+    transactions: list[dict[str, Any]],
+) -> str:
+    if not transactions:
+        return "UNKNOWN"
+
+    return max(
+        (str(transaction.get("status") or "UNKNOWN").upper()
+         for transaction in transactions),
+        key=severity_rank,
+    )
+
+
+def unique_dicts(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    unique_items = []
+    seen = set()
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        identity = json.dumps(
+            item,
+            sort_keys=True,
+            default=str,
+        )
+
+        if identity in seen:
+            continue
+
+        seen.add(identity)
+        unique_items.append(item)
+
+    return unique_items
+
+
+def merge_hsm_analysis_group(
+    transactions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    commands = []
+    result_codes = []
+    threads = []
+    documentation_findings = []
+
+    for transaction in transactions:
+        hsm_analysis = transaction.get("hsm_analysis") or {}
+
+        if hsm_analysis.get("thread"):
+            threads.append(str(hsm_analysis["thread"]))
+
+        result_codes.extend(
+            str(code)
+            for code in hsm_analysis.get("result_codes", [])
+            if code
+        )
+        commands.extend(
+            command
+            for command in hsm_analysis.get("commands", [])
+            if isinstance(command, dict)
+        )
+        documentation_findings.extend(
+            finding
+            for finding in hsm_analysis.get("documentation_findings", [])
+            if isinstance(finding, dict)
+        )
+
+    commands = unique_dicts(commands)
+
+    for order, command in enumerate(commands, start=1):
+        command["order"] = order
+
+    return {
+        "thread": ", ".join(dict.fromkeys(threads)),
+        "commands": commands,
+        "result_codes": list(dict.fromkeys(result_codes)),
+        "documentation_findings": unique_dicts(documentation_findings),
+    }
+
+
+def merge_log_story_group(
+    transactions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    story = []
+
+    for transaction in transactions:
+        story.extend(
+            item
+            for item in transaction.get("log_story", [])
+            if isinstance(item, dict)
+        )
+
+    for order, item in enumerate(story, start=1):
+        item["order"] = order
+
+    return story
+
+
+def merge_fields_group(
+    transactions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    merged_fields: dict[str, Any] = {}
+
+    for transaction in transactions:
+        for field, value in (transaction.get("fields") or {}).items():
+            if value in (None, ""):
+                continue
+
+            if field not in merged_fields or not merged_fields[field]:
+                merged_fields[field] = value
+
+    response_candidates = [
+        transaction
+        for transaction in transactions
+        if (transaction.get("fields") or {}).get("039")
+    ]
+
+    if response_candidates:
+        final_response = max(
+            response_candidates,
+            key=lambda transaction: (
+                1
+                if transaction.get("mti") in {"0110", "0210"}
+                else 0,
+                transaction.get("start_line") or 0,
+                transaction.get("log_index") or 0,
+            ),
+        )
+        merged_fields["039"] = (
+            final_response.get("fields") or {}
+        ).get("039")
+
+    return merged_fields
+
+
+def merge_business_transaction_group(
+    transactions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    ordered_transactions = sorted(
+        transactions,
+        key=lambda transaction: (
+            transaction.get("start_line") or 0,
+            transaction.get("log_index") or 0,
+        ),
+    )
+    primary = dict(ordered_transactions[0])
+    fields = merge_fields_group(ordered_transactions)
+    log_story = merge_log_story_group(ordered_transactions)
+    hsm_analysis = merge_hsm_analysis_group(ordered_transactions)
+    documentation_findings = unique_dicts([
+        finding
+        for transaction in ordered_transactions
+        for finding in transaction.get("documentation_findings", [])
+        if isinstance(finding, dict)
+    ])[:MAX_DOCUMENTATION_FINDINGS]
+    sources = unique_dicts([
+        source
+        for transaction in ordered_transactions
+        for source in transaction.get("sources", [])
+        if isinstance(source, dict)
+    ])
+    evidence = unique_dicts([
+        evidence_item
+        for transaction in ordered_transactions
+        for evidence_item in transaction.get("evidence", [])
+        if isinstance(evidence_item, dict)
+    ])
+    related_mtis = [
+        str(transaction.get("mti"))
+        for transaction in ordered_transactions
+        if transaction.get("mti")
+    ]
+
+    primary.update({
+        "transaction_id": (
+            f"group_{fields.get('037')}"
+            if fields.get("037")
+            else primary.get("transaction_id")
+        ),
+        "grouped_transaction_ids": [
+            transaction.get("transaction_id")
+            for transaction in ordered_transactions
+            if transaction.get("transaction_id")
+        ],
+        "grouped_log_indices": [
+            transaction.get("log_index")
+            for transaction in ordered_transactions
+            if transaction.get("log_index") is not None
+        ],
+        "related_mtis": list(dict.fromkeys(related_mtis)),
+        "fields": fields,
+        "status": strongest_status(ordered_transactions),
+        "log_story": log_story,
+        "hsm_analysis": hsm_analysis,
+        "documentation_findings": documentation_findings,
+        "sources": sources,
+        "evidence": evidence,
+        "start_line": min(
+            transaction.get("start_line") or 0
+            for transaction in ordered_transactions
+        ),
+        "end_line": max(
+            transaction.get("end_line") or 0
+            for transaction in ordered_transactions
+        ),
+    })
+    primary["observed_facts"] = observed_facts_for_transaction(primary)
+    primary["display_name"] = (
+        f"FLD 037 {fields.get('037')}"
+        if fields.get("037")
+        else primary.get("display_name")
+    )
+
+    return primary
+
+
+def is_merged_response_block(
+    transaction: dict[str, Any],
+) -> bool:
+    return bool(transaction.get("merged_into_transaction_id"))
+
+
+def visible_response_transactions(
+    transactions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    visible_transactions = [
+        transaction
+        for transaction in transactions
+        if (
+            transaction_has_visible_analysis(transaction)
+            and not is_merged_response_block(transaction)
+        )
+    ]
+    grouped_transactions: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+    for transaction in visible_transactions:
+        grouped_transactions.setdefault(
+            transaction_group_key(transaction),
+            [],
+        ).append(transaction)
+
+    return [
+        merge_business_transaction_group(group)
+        for group in grouped_transactions.values()
+    ]
+
+
 def select_transactions_for_question(
     transactions: list[dict[str, Any]],
     question: str,
@@ -795,7 +1117,12 @@ def select_transactions_for_question(
         )
     ]
 
-    return matched_transactions[:MAX_RESPONSE_TRANSACTIONS], constraints
+    return (
+        visible_response_transactions(matched_transactions)[
+            :MAX_RESPONSE_TRANSACTIONS
+        ],
+        constraints,
+    )
 
 
 def parse_xlsx_row(
@@ -1006,17 +1333,16 @@ def filter_documented_log_story(
     if not documented_names:
         return
 
-    filtered_story = [
-        item
-        for item in transaction.get("log_story", [])
-        if normalize_function_name(item.get("function_name", ""))
-        in documented_names
-    ]
+    log_story = transaction.get("log_story", [])
 
-    for order, item in enumerate(filtered_story, start=1):
+    for order, item in enumerate(log_story, start=1):
         item["order"] = order
+        item["documented_in_excel"] = (
+            normalize_function_name(item.get("function_name", ""))
+            in documented_names
+        )
 
-    transaction["log_story"] = filtered_story
+    transaction["log_story"] = log_story
 
 
 def build_error_payload(
@@ -1072,6 +1398,231 @@ def append_unique_reference(
 
     if reference_key(reference) not in existing_keys:
         references.append(reference)
+
+
+def normalize_field_number(
+    value: Any,
+) -> str:
+    raw_value = str(value or "").strip()
+
+    if not raw_value:
+        return ""
+
+    if "." in raw_value:
+        first_part, second_part = raw_value.split(".", 1)
+        return f"{first_part.zfill(3)}.{second_part}"
+
+    return raw_value.zfill(3)
+
+
+def section_field_numbers(
+    section: dict[str, Any],
+) -> set[str]:
+    heading = str(section.get("heading") or "")
+
+    for source_text in (heading, str(section.get("text") or "")):
+        numbers = set()
+
+        for match in re.finditer(
+            r"\b(?:Field|FLD)\s*\(?0*(\d{1,3}(?:\.\d+)?)\)?\b",
+            source_text,
+            flags=re.IGNORECASE,
+        ):
+            numbers.add(normalize_field_number(match.group(1)))
+
+        if numbers:
+            return numbers
+
+    return set()
+
+
+def extract_fixed_length_rule(
+    section: dict[str, Any],
+) -> dict[str, Any] | None:
+    text = re.sub(
+        r"\s+",
+        " ",
+        " ".join(
+            str(value or "")
+            for value in (
+                section.get("heading"),
+                section.get("text"),
+            )
+        ),
+    ).strip()
+
+    if not re.search(r"\bfixed\s+length\b", text, flags=re.IGNORECASE):
+        return None
+
+    match = re.search(
+        r"\bfixed\s+length\s+(\d{1,4})\s*([A-Z]{1,8})?",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    return {
+        "length": int(match.group(1)),
+        "format": (match.group(2) or "").upper(),
+        "rule_text": compact_text(match.group(0), limit=120),
+    }
+
+
+def build_pdf_field_length_rules(
+    pdf_sections: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    rules: dict[str, dict[str, Any]] = {}
+
+    for section in pdf_sections:
+        length_rule = extract_fixed_length_rule(section)
+
+        if not length_rule:
+            continue
+
+        for field in section_field_numbers(section):
+            existing = rules.get(field)
+
+            if existing and existing.get("page") <= (section.get("page") or 0):
+                continue
+
+            reference = reference_from_section(section)
+            format_suffix = (
+                f" {length_rule['format']}"
+                if length_rule["format"]
+                else ""
+            )
+            format_description = (
+                f" et un format {length_rule['format']}"
+                if length_rule["format"]
+                else ""
+            )
+            rules[field] = {
+                "field": field,
+                "operator": "length_equals",
+                "expected": length_rule["length"],
+                "format": length_rule["format"],
+                "expected_condition": (
+                    f"Longueur fixe {length_rule['length']}"
+                    f"{format_suffix}"
+                ),
+                "description": (
+                    f"Le PDF indique que le Field {field} a une longueur fixe "
+                    f"de {length_rule['length']}"
+                    f"{format_description}."
+                ),
+                "rule_text": length_rule["rule_text"],
+                "section": section,
+                "source_reference": reference,
+                "page": section.get("page") or 0,
+            }
+
+    return rules
+
+
+def clean_field_value_for_length_check(
+    value: Any,
+) -> str | None:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    if not text or text.upper() == "N/A" or "*" in text:
+        return None
+
+    return re.sub(r"\s+", "", text)
+
+
+def build_pdf_length_documentation_findings(
+    transaction: dict[str, Any],
+    field_length_rules: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    findings = []
+    fields = transaction.get("fields") or {}
+
+    for field, raw_value in fields.items():
+        normalized_field = normalize_field_number(field)
+        rule = field_length_rules.get(normalized_field)
+
+        if not rule:
+            continue
+
+        observed_value = clean_field_value_for_length_check(raw_value)
+
+        if observed_value is None:
+            continue
+
+        observed_length = len(observed_value)
+        expected_length = rule["expected"]
+
+        if observed_length == expected_length:
+            continue
+
+        reference = rule.get("source_reference") or {}
+        section = rule.get("section") or {}
+
+        findings.append({
+            "source_type": "pdf",
+            "type": "length_non_conformity",
+            "anomaly": (
+                f"Longueur non conforme du FLD {normalized_field}."
+            ),
+            "field": normalized_field,
+            "observed_value": (
+                f"{raw_value} ({observed_length} caractere(s))"
+            ),
+            "expected_condition": (
+                f"{rule['expected_condition']} "
+                f"({expected_length} caractere(s) attendu(s))"
+            ),
+            "context": f"MTI {transaction.get('mti') or 'UNKNOWN'}",
+            "expected_rule": rule["description"],
+            "explanation": (
+                "La valeur observee ne respecte pas la longueur fixe "
+                "documentee pour ce champ."
+            ),
+            "rule": {
+                "rule_id": f"field_{normalized_field}_length",
+                "description": rule["description"],
+                "conditions": [
+                    {
+                        "field": normalized_field,
+                        "operator": "length_equals",
+                        "expected": expected_length,
+                    }
+                ],
+                "reference": {
+                    "document": reference.get("source", ""),
+                    "page": reference.get("page"),
+                    "section": section.get("heading") or reference.get("section", ""),
+                    "table": "",
+                },
+            },
+            "comparison": {
+                "rule_id": f"field_{normalized_field}_length",
+                "status": "ANOMALY",
+                "condition_results": [
+                    {
+                        "field": normalized_field,
+                        "operator": "length_equals",
+                        "observed": observed_value,
+                        "expected": expected_length,
+                        "status": "VIOLATED",
+                    }
+                ],
+            },
+            "conclusion": "Anomalie demontree par la documentation",
+            **reference,
+            "heading": section.get("heading"),
+            "evidence": rule.get("rule_text") or rule["description"],
+        })
+
+        if len(findings) >= MAX_DOCUMENTATION_FINDINGS:
+            break
+
+    return findings
 
 
 def observed_pdf_anomalies(
@@ -1228,6 +1779,17 @@ def condition_comparison_result(
             if str(observed or "").isdigit() and int(str(observed)) == 0
             else "VIOLATED"
         )
+    elif operator == "length_equals":
+        observed_value = clean_field_value_for_length_check(observed)
+
+        if observed_value is None:
+            status = "NOT_VERIFIABLE"
+        else:
+            status = (
+                "COMPLIANT"
+                if len(observed_value) == int(expected)
+                else "VIOLATED"
+            )
     else:
         status = "NOT_VERIFIABLE"
 
@@ -1414,10 +1976,106 @@ def hsm_command_query(
     )
 
 
+def is_hsm_reference_section(
+    section: dict[str, Any],
+) -> bool:
+    source = str(section.get("source") or "").lower()
+    heading = str(section.get("heading") or "").lower()
+    text = str(section.get("text") or "").lower()
+
+    if any(term in source for term in HSM_DOCUMENT_SOURCE_TERMS):
+        return True
+
+    if "base i technical specifications" in source:
+        return False
+
+    combined = f"{heading} {text}"
+
+    return (
+        "hsm" in combined
+        and any(term in combined for term in HSM_DOCUMENT_TEXT_TERMS)
+    )
+
+
+def hsm_document_sections(
+    sections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        section
+        for section in sections
+        if is_hsm_reference_section(section)
+    ]
+
+
+def clean_hsm_meaning(
+    value: str,
+) -> str:
+    cleaned = re.sub(r"\s+", " ", value or "").strip()
+    cleaned = re.sub(
+        r"\s+(?:'?\d{2}'?\s*[:\-].*)$",
+        "",
+        cleaned,
+    ).strip()
+
+    return cleaned.strip(" .;")
+
+
+def extract_hsm_return_code_meaning(
+    section: dict[str, Any],
+    command: dict[str, Any],
+) -> str:
+    text = str(section.get("text") or "")
+    response_command = str(command.get("response_command") or "").upper()
+    result_code = str(command.get("hsm_result_code") or "").upper()
+    return_code = str(command.get("return_code") or result_code[2:]).upper()
+
+    if not return_code:
+        return ""
+
+    normalized_text = re.sub(r"\s+", " ", text)
+
+    if response_command:
+        response_patterns = (
+            rf"\bvalue\s*['\"]?{re.escape(response_command)}['\"]?",
+            rf"\bresponse\s+code\b.*?['\"]?{re.escape(response_command)}['\"]?",
+            rf"\b{re.escape(response_command)}\b",
+        )
+        if not any(
+            re.search(pattern, normalized_text, flags=re.IGNORECASE)
+            for pattern in response_patterns
+        ):
+            return ""
+
+    code_pattern = re.compile(
+        rf"['\"]?{re.escape(return_code)}['\"]?\s*[:\-]\s*"
+        r"(?P<meaning>.*?)(?=\s+['\"]?\d{2}['\"]?\s*[:\-]|\s+or\s+a\s+standard\s+error\s+code\.|$)",
+        flags=re.IGNORECASE,
+    )
+    match = code_pattern.search(normalized_text)
+
+    if match:
+        return clean_hsm_meaning(match.group("meaning"))
+
+    line_pattern = re.compile(
+        rf"^\s*['\"]?{re.escape(return_code)}['\"]?\s*[:\-]\s*(?P<meaning>.+)$",
+        flags=re.IGNORECASE,
+    )
+
+    for line in text.splitlines():
+        line_match = line_pattern.search(line)
+        if line_match:
+            return clean_hsm_meaning(line_match.group("meaning"))
+
+    return ""
+
+
 def pdf_section_supports_hsm_command(
     section: dict[str, Any],
     command: dict[str, Any],
 ) -> bool:
+    if not is_hsm_reference_section(section):
+        return False
+
     text = " ".join(
         str(value or "")
         for value in (
@@ -1453,10 +2111,236 @@ def pdf_section_supports_hsm_command(
     return False
 
 
+def hsm_section_mentions_command_code(
+    section: dict[str, Any],
+    command_code: str,
+) -> bool:
+    if not command_code:
+        return True
+
+    combined = " ".join(
+        str(value or "")
+        for value in (
+            section.get("heading"),
+            section.get("text"),
+        )
+    )
+
+    patterns = (
+        rf"\b{re.escape(command_code)}\s+command\b",
+        rf"\bcommand\s+{re.escape(command_code)}\b",
+        rf"\bcommand_{re.escape(command_code)}\b",
+        rf"\bvalue\s*['\"]?{re.escape(command_code)}['\"]?",
+    )
+
+    return any(
+        re.search(pattern, combined, flags=re.IGNORECASE)
+        for pattern in patterns
+    )
+
+
+def ordered_hsm_sections(
+    sections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return sorted(
+        sections,
+        key=lambda section: (
+            str(section.get("document_id") or section.get("source") or ""),
+            int(section.get("section_index") or 0),
+            int(section.get("chunk_index") or 0),
+            int(section.get("page") or 0),
+        ),
+    )
+
+
+def hsm_sections_with_command_context(
+    sections: list[dict[str, Any]],
+    command_code: str,
+    context_window: int = 6,
+) -> list[dict[str, Any]]:
+    if not command_code:
+        return ordered_hsm_sections(sections)
+
+    command_code = command_code.upper()
+    candidates = []
+    last_command_position_by_document: dict[str, int] = {}
+
+    for position, section in enumerate(ordered_hsm_sections(sections)):
+        document_key = str(
+            section.get("document_id")
+            or section.get("source")
+            or "document"
+        )
+
+        if hsm_section_mentions_command_code(section, command_code):
+            last_command_position_by_document[document_key] = position
+
+        last_position = last_command_position_by_document.get(document_key)
+
+        if last_position is None:
+            continue
+
+        if position - last_position <= context_window:
+            candidates.append(section)
+
+    return candidates
+
+
 def documented_hsm_value(
     value: str | None,
 ) -> str:
     return value or "Non trouve dans la documentation fournie"
+
+
+def reference_from_hsm_fact(
+    fact: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "source": fact.get("source") or "Document",
+        "original_source": fact.get("source") or "Document",
+        "document_id": str(fact.get("document_id") or ""),
+        "page": fact.get("page"),
+        "pdf_page": fact.get("page"),
+        "printed_page": fact.get("printed_page"),
+        "section": fact.get("heading"),
+        "heading": fact.get("heading"),
+        "sheet": fact.get("sheet"),
+        "paragraph": fact.get("paragraph"),
+    }
+
+
+async def find_structured_hsm_return_code_fact(
+    command: dict[str, Any],
+    hsm_pdf_sections: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    document_ids = list(dict.fromkeys(
+        str(section.get("document_id"))
+        for section in hsm_pdf_sections
+        if section.get("document_id")
+    ))
+    response_command = str(command.get("response_command") or "").upper()
+    result_code = str(command.get("hsm_result_code") or "").upper()
+    return_code = str(command.get("return_code") or result_code[2:]).upper()
+
+    if not document_ids or not response_command or not return_code:
+        return None
+
+    query = {
+        "fact_type": "hsm_return_code",
+        "document_id": {"$in": document_ids},
+        "response_command": response_command,
+        "return_code": return_code,
+    }
+    command_code = str(command.get("command") or "").upper()
+
+    if command_code:
+        return await document_facts_collection.find_one({
+            **query,
+            "command": command_code,
+        })
+
+    return await document_facts_collection.find_one(query)
+
+
+def hsm_finding_from_structured_fact(
+    command: dict[str, Any],
+    transaction_thread: str | None,
+    fact: dict[str, Any],
+) -> dict[str, Any]:
+    code_meaning = str(fact.get("meaning") or "").strip()
+    return_code = str(command.get("return_code") or fact.get("return_code") or "")
+    documented_code_line = (
+        f"'{return_code}': {code_meaning}"
+        if return_code and code_meaning
+        else code_meaning
+    )
+    explanation = (
+        f"{command.get('hsm_result_code')} correspond a la reponse "
+        f"{command.get('response_command')} avec le code retour "
+        f"{command.get('return_code')}. Signification documentee: "
+        f"{documented_code_line}."
+    )
+
+    return {
+        "source_type": "pdf",
+        "type": "hsm_code_explanation",
+        "title": (
+            f"HSM result {command.get('hsm_result_code')} "
+            f"for {command.get('command') or 'command'}"
+        ),
+        "command": command.get("command"),
+        "response_command": command.get("response_command"),
+        "hsm_result_code": command.get("hsm_result_code"),
+        "return_code": command.get("return_code"),
+        "thread": command.get("thread") or transaction_thread,
+        "explanation": explanation,
+        "return_code_meaning": code_meaning,
+        "documented_return_code_line": documented_code_line,
+        **reference_from_hsm_fact(fact),
+        "evidence": explanation,
+    }
+
+
+def hsm_finding_from_section_meaning(
+    command: dict[str, Any],
+    transaction_thread: str | None,
+    section: dict[str, Any],
+    code_meaning: str,
+) -> dict[str, Any]:
+    return_code = str(command.get("return_code") or "")
+    documented_code_line = (
+        f"'{return_code}': {code_meaning}"
+        if return_code and code_meaning
+        else code_meaning
+    )
+    explanation = (
+        f"{command.get('hsm_result_code')} correspond a la reponse "
+        f"{command.get('response_command')} avec le code retour "
+        f"{command.get('return_code')}. Signification documentee: "
+        f"{documented_code_line}."
+    )
+
+    return {
+        "source_type": "pdf",
+        "type": "hsm_code_explanation",
+        "title": (
+            f"HSM result {command.get('hsm_result_code')} "
+            f"for {command.get('command') or 'command'}"
+        ),
+        "command": command.get("command"),
+        "response_command": command.get("response_command"),
+        "hsm_result_code": command.get("hsm_result_code"),
+        "return_code": command.get("return_code"),
+        "thread": command.get("thread") or transaction_thread,
+        "explanation": explanation,
+        "return_code_meaning": code_meaning,
+        "documented_return_code_line": documented_code_line,
+        **reference_from_section(section),
+        "heading": section.get("heading"),
+        "evidence": explanation,
+    }
+
+
+def find_hsm_return_code_meaning_section(
+    command: dict[str, Any],
+    hsm_pdf_sections: list[dict[str, Any]],
+) -> tuple[dict[str, Any], str] | tuple[None, str]:
+    command_code = str(command.get("command") or "").upper()
+    candidate_sections = hsm_sections_with_command_context(
+        sections=hsm_pdf_sections,
+        command_code=command_code,
+    )
+
+    for section in candidate_sections:
+        code_meaning = extract_hsm_return_code_meaning(
+            section=section,
+            command=command,
+        )
+
+        if code_meaning:
+            return section, code_meaning
+
+    return None, ""
 
 
 async def build_hsm_documentation_findings(
@@ -1466,9 +2350,100 @@ async def build_hsm_documentation_findings(
 ) -> list[dict[str, Any]]:
     hsm_analysis = transaction.get("hsm_analysis") or {}
     findings = []
+    hsm_pdf_sections = hsm_document_sections(pdf_sections)
 
     for command in hsm_analysis.get("commands", []):
         if not command.get("request_message") and not command.get("hsm_result_code"):
+            continue
+
+        structured_fact = await find_structured_hsm_return_code_fact(
+            command=command,
+            hsm_pdf_sections=hsm_pdf_sections,
+        )
+
+        if structured_fact:
+            finding = hsm_finding_from_structured_fact(
+                command=command,
+                transaction_thread=hsm_analysis.get("thread"),
+                fact=structured_fact,
+            )
+            findings.append(finding)
+            command_findings = [finding]
+            primary_heading = structured_fact.get("heading")
+            primary_explanation = finding["explanation"]
+            primary_code_meaning = finding["return_code_meaning"]
+
+            command["command_name"] = documented_hsm_value(primary_heading)
+            command["command_description"] = documented_hsm_value(
+                primary_explanation
+            )
+            command["response_name"] = documented_hsm_value(
+                primary_heading
+                if command.get("response_command")
+                else ""
+            )
+            command["return_code_meaning"] = documented_hsm_value(
+                primary_code_meaning
+            )
+            command["documented_return_code_line"] = documented_hsm_value(
+                finding.get("documented_return_code_line")
+            )
+            command["functional_result"] = (
+                "SUCCESS"
+                if command.get("status") == "SUCCESS"
+                else "FAILED"
+                if command.get("status") == "FAILED"
+                else command.get("status") or "UNKNOWN"
+            )
+            command["technical_interpretation"] = documented_hsm_value(
+                primary_explanation
+            )
+            command["documentation_findings"] = command_findings
+            continue
+
+        exact_section, exact_code_meaning = find_hsm_return_code_meaning_section(
+            command=command,
+            hsm_pdf_sections=hsm_pdf_sections,
+        )
+
+        if exact_section and exact_code_meaning:
+            finding = hsm_finding_from_section_meaning(
+                command=command,
+                transaction_thread=hsm_analysis.get("thread"),
+                section=exact_section,
+                code_meaning=exact_code_meaning,
+            )
+            findings.append(finding)
+            command_findings = [finding]
+            primary_heading = exact_section.get("heading")
+            primary_explanation = finding["explanation"]
+
+            command["command_name"] = documented_hsm_value(primary_heading)
+            command["command_description"] = documented_hsm_value(
+                primary_explanation
+            )
+            command["response_name"] = documented_hsm_value(
+                primary_heading
+                if command.get("response_command")
+                else ""
+            )
+            command["return_code_meaning"] = documented_hsm_value(
+                exact_code_meaning
+            )
+            command["documented_return_code_line"] = documented_hsm_value(
+                finding.get("documented_return_code_line")
+            )
+            command["functional_result"] = (
+                "SUCCESS"
+                if command.get("status") == "SUCCESS"
+                else "FAILED"
+                if command.get("status") == "FAILED"
+                else command.get("status") or "UNKNOWN"
+            )
+            command["technical_interpretation"] = documented_hsm_value(
+                primary_explanation
+            )
+            command["documentation_findings"] = command_findings
             continue
 
         command_query = " ".join([
@@ -1478,11 +2453,11 @@ async def build_hsm_documentation_findings(
         selected_pdf_sections = (
             await select_relevant_sections(
                 question=command_query,
-                sections=pdf_sections,
+                sections=hsm_pdf_sections,
                 limit=MAX_HSM_REFERENCE_SECTIONS,
                 use_embeddings=False,
             )
-            if pdf_sections
+            if hsm_pdf_sections
             else []
         )
         command_findings = []
@@ -1491,11 +2466,13 @@ async def build_hsm_documentation_findings(
             if not pdf_section_supports_hsm_command(section, command):
                 continue
 
-            excerpt = extract_relevant_excerpt(
-                question=command_query,
-                text=section.get("text", ""),
+            code_meaning = extract_hsm_return_code_meaning(
+                section=section,
+                command=command,
             )
-            reference = reference_from_section(section)
+
+            if not code_meaning:
+                continue
 
             finding = {
                 "source_type": "pdf",
@@ -1509,15 +2486,31 @@ async def build_hsm_documentation_findings(
                 "hsm_result_code": command.get("hsm_result_code"),
                 "return_code": command.get("return_code"),
                 "thread": command.get("thread") or hsm_analysis.get("thread"),
-                "explanation": excerpt,
-                **reference,
+                "explanation": (
+                    f"{command.get('hsm_result_code')} correspond a la reponse "
+                    f"{command.get('response_command')} avec le code retour "
+                    f"{command.get('return_code')}. Signification documentee: "
+                    f"'{command.get('return_code')}': {code_meaning}."
+                ),
+                "return_code_meaning": code_meaning,
+                "documented_return_code_line": (
+                    f"'{command.get('return_code')}': {code_meaning}"
+                    if command.get("return_code")
+                    else code_meaning
+                ),
+                **reference_from_section(section),
                 "heading": section.get("heading"),
-                "evidence": excerpt,
+                "evidence": (
+                    f"{command.get('hsm_result_code')} correspond a la reponse "
+                    f"{command.get('response_command')} avec le code retour "
+                    f"{command.get('return_code')}. Signification documentee: "
+                    f"'{command.get('return_code')}': {code_meaning}."
+                ),
             }
             command_findings.append(finding)
             findings.append(finding)
 
-            if len(command_findings) >= 2:
+            if code_meaning or len(command_findings) >= 2:
                 break
 
         primary_finding = command_findings[0] if command_findings else None
@@ -1528,6 +2521,11 @@ async def build_hsm_documentation_findings(
         )
         primary_heading = (
             primary_finding.get("heading")
+            if primary_finding
+            else ""
+        )
+        primary_code_meaning = (
+            primary_finding.get("return_code_meaning")
             if primary_finding
             else ""
         )
@@ -1542,7 +2540,13 @@ async def build_hsm_documentation_findings(
             else ""
         )
         command["return_code_meaning"] = documented_hsm_value(
-            primary_explanation
+            primary_code_meaning
+            or primary_explanation
+        )
+        command["documented_return_code_line"] = documented_hsm_value(
+            primary_finding.get("documented_return_code_line")
+            if primary_finding
+            else ""
         )
         command["functional_result"] = (
             "Non determine: aucune explication documentaire trouvee."
@@ -1578,6 +2582,7 @@ async def enrich_transactions_with_documentation(
         if str(section.get("source", "")).lower().endswith(".pdf")
     ]
     documented_names = documented_function_names(xlsx_sections)
+    field_length_rules = build_pdf_field_length_rules(pdf_sections)
 
     for transaction in transactions:
         filter_documented_log_story(
@@ -1612,12 +2617,16 @@ async def enrich_transactions_with_documentation(
             for section in selected_pdf_sections
         ]
         transaction["documentation_findings"] = (
-            build_pdf_documentation_findings(
+            build_pdf_length_documentation_findings(
+                transaction=transaction,
+                field_length_rules=field_length_rules,
+            )
+            + build_pdf_documentation_findings(
                 transaction=transaction,
                 selected_pdf_sections=selected_pdf_sections,
                 query=query,
             )
-        )
+        )[:MAX_DOCUMENTATION_FINDINGS]
         hsm_findings = await build_hsm_documentation_findings(
             transaction=transaction,
             pdf_sections=pdf_sections,
@@ -1900,9 +2909,10 @@ def response_transactions(
             "nok",
         )
     )
+    visible_transactions = visible_response_transactions(transactions)
     hsm_transactions = [
         transaction
-        for transaction in transactions
+        for transaction in visible_transactions
         if (transaction.get("hsm_analysis") or {}).get("commands")
     ]
 
@@ -1911,7 +2921,7 @@ def response_transactions(
 
     important_transactions = [
         transaction
-        for transaction in transactions
+        for transaction in visible_transactions
         if should_enrich_transaction(transaction)
     ]
 
@@ -1921,7 +2931,7 @@ def response_transactions(
     if important_transactions:
         remaining = [
             transaction
-            for transaction in transactions
+            for transaction in visible_transactions
             if transaction not in important_transactions
         ]
         return [
@@ -1929,7 +2939,7 @@ def response_transactions(
             *remaining,
         ][:MAX_RESPONSE_TRANSACTIONS]
 
-    return transactions[:MAX_RESPONSE_TRANSACTIONS]
+    return visible_transactions[:MAX_RESPONSE_TRANSACTIONS]
 
 
 async def enrich_with_llm(
@@ -2048,6 +3058,17 @@ async def answer_log_question(
         conversation_id=conversation_id,
         referenced_document_ids=referenced_document_ids,
     )
+
+    screenshot_response = await answer_screenshot_question(
+        question=question,
+        conversation_id=conversation_id,
+        referenced_document_ids=effective_document_ids,
+        agent="log",
+    )
+
+    if screenshot_response is not None:
+        return screenshot_response
+
     log_texts = await load_log_texts(
         conversation_id=conversation_id,
         referenced_document_ids=effective_document_ids,
@@ -2117,7 +3138,9 @@ async def answer_log_question(
         reference_sections=reference_sections,
     )
 
-    statistics = build_statistics(transactions)
+    statistics = build_statistics(
+        visible_response_transactions(transactions)
+    )
     apply_deterministic_enrichment(transactions)
     summary = deterministic_summary(
         transactions=transactions,

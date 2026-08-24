@@ -1,8 +1,6 @@
 import re
 from typing import Any
 
-from app.services.extraction_service import mask_field_002_value
-
 
 TRANSACTION_START_PATTERN = re.compile(
     r"\bStart\s+Dump(?:Visa|Cis|Iso|Postilion)\s*\(",
@@ -14,13 +12,13 @@ MTI_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 FIELD_PATTERN = re.compile(
-    r"\bFLD\s*\(\s*0*(?P<field>002|003|037|039)\s*\)"
+    r"\bFLD\s*\(\s*0*(?P<field>\d{1,3}(?:\.\d+)?)\s*\)"
     r"\s*:?\s*\([^)]*\)\s*:?\s*\[(?P<value>[^\]]*)\]",
     flags=re.IGNORECASE,
 )
 TLV_FIELD_PATTERN = re.compile(
     r"^\s*(?:\S+\s+)*\d+\|\d+\|\s*"
-    r"0*(?P<field>002|003|037|039)\s*\{[^}]*\}\s*"
+    r"0*(?P<field>\d{1,3}(?:\.\d+)?)\s*\{[^}]*\}\s*"
     r"\d+\s+(?P<value>.+?)\s*\.?\s*$",
     flags=re.IGNORECASE,
 )
@@ -105,8 +103,29 @@ MTI_LABELS = {
     "0110": "Authorization Response",
     "0200": "Authorization Request",
     "0210": "Authorization Response",
+    "1100": "Authorization Request",
+    "1110": "Authorization Response",
     "0800": "Network Management Request",
     "0810": "Network Management Response",
+}
+AUTHORIZATION_REQUEST_MTIS = {
+    "0100",
+    "0200",
+    "1100",
+}
+AUTHORIZATION_RESPONSE_MTIS = {
+    "0110",
+    "0210",
+    "1110",
+    "1210",
+}
+FINAL_AUTHORIZATION_RESPONSE_MTIS = {
+    "0110",
+    "0210",
+}
+NETWORK_MANAGEMENT_MTIS = {
+    "0800",
+    "0810",
 }
 
 
@@ -118,9 +137,6 @@ def mask_field_value(
         return None
 
     cleaned_value = value.strip()
-
-    if field == "002":
-        return mask_field_002_value(cleaned_value)
 
     return cleaned_value
 
@@ -134,6 +150,18 @@ def normalize_mti_value(
         return cleaned_value.zfill(4)
 
     return cleaned_value
+
+
+def normalize_field_id(
+    value: str,
+) -> str:
+    cleaned_value = value.strip()
+
+    if "." in cleaned_value:
+        base, suffix = cleaned_value.split(".", 1)
+        return f"{base.zfill(3)}.{suffix}"
+
+    return cleaned_value.zfill(3)
 
 
 def extract_tlv_field_value(
@@ -297,7 +325,7 @@ def parse_transaction_fields(
         is_tlv_field = False
 
         if field_match:
-            field = field_match.group("field")
+            field = normalize_field_id(field_match.group("field"))
             value = field_match.group("value")
         else:
             tlv_field = extract_tlv_field_value(line)
@@ -306,10 +334,8 @@ def parse_transaction_fields(
                 continue
 
             field, value = tlv_field
+            field = normalize_field_id(field)
             is_tlv_field = True
-
-        if field not in fields:
-            continue
 
         if is_tlv_field and fields.get(field):
             continue
@@ -936,18 +962,7 @@ def parse_hsm_analysis(
 def mask_log_line(
     line: str,
 ) -> str:
-    return re.sub(
-        r"(?P<prefix>\bFLD\s*\(\s*0*002\s*\)[^\[]*\[)"
-        r"(?P<value>[^\]]+)"
-        r"(?P<suffix>\])",
-        lambda match: (
-            f"{match.group('prefix')}"
-            f"{mask_field_002_value(match.group('value'))}"
-            f"{match.group('suffix')}"
-        ),
-        line,
-        flags=re.IGNORECASE,
-    )
+    return line
 
 
 def transaction_status(
@@ -1061,6 +1076,170 @@ def observed_facts_for_transaction(
     return facts
 
 
+def merge_response_blocks_with_requests(
+    transactions: list[dict[str, Any]],
+) -> None:
+    requests_by_rrn: dict[str, dict[str, Any]] = {}
+
+    for transaction in transactions:
+        mti = transaction.get("mti")
+        fields = transaction.get("fields", {})
+        rrn = fields.get("037")
+
+        if mti in AUTHORIZATION_REQUEST_MTIS and rrn:
+            requests_by_rrn[rrn] = transaction
+            continue
+
+        if mti not in AUTHORIZATION_RESPONSE_MTIS or not rrn:
+            continue
+
+        request_transaction = requests_by_rrn.get(rrn)
+
+        if not request_transaction:
+            continue
+
+        request_fields = request_transaction.setdefault("fields", {})
+
+        if fields.get("039"):
+            request_fields["039"] = fields["039"]
+
+        request_transaction["response_mti"] = mti
+        request_transaction["response_fields"] = {
+            field: value
+            for field, value in fields.items()
+            if value
+        }
+        request_transaction["response_log_index"] = transaction.get(
+            "log_index"
+        )
+        request_transaction["response_transaction_id"] = transaction.get(
+            "transaction_id"
+        )
+        transaction["merged_into_transaction_id"] = request_transaction.get(
+            "transaction_id"
+        )
+
+        request_transaction.setdefault("evidence", []).extend(
+            transaction.get("evidence", [])
+        )
+        request_transaction["status"] = transaction_status(
+            request_fields,
+            request_transaction.get("log_story", []),
+            request_transaction.get("hsm_analysis"),
+        )
+        request_transaction["display_name"] = transaction_display_name(
+            index=request_transaction.get("log_index") or 0,
+            mti=request_transaction.get("mti"),
+            fields=request_fields,
+            hsm_analysis=request_transaction.get("hsm_analysis"),
+        )
+        request_transaction["observed_facts"] = observed_facts_for_transaction(
+            request_transaction
+        )
+
+
+def backfill_related_response_codes_by_rrn(
+    transactions: list[dict[str, Any]],
+) -> None:
+    responses_by_rrn: dict[str, list[dict[str, Any]]] = {}
+
+    for transaction in transactions:
+        mti = transaction.get("mti")
+        fields = transaction.get("fields", {})
+        rrn = fields.get("037")
+
+        if (
+            mti in AUTHORIZATION_RESPONSE_MTIS
+            and rrn
+            and fields.get("039")
+        ):
+            responses_by_rrn.setdefault(rrn, []).append(transaction)
+
+    for responses in responses_by_rrn.values():
+        responses.sort(
+            key=lambda item: (
+                item.get("start_line") or 0,
+                item.get("log_index") or 0,
+            )
+        )
+
+    for transaction in transactions:
+        mti = transaction.get("mti")
+        fields = transaction.get("fields", {})
+        rrn = fields.get("037")
+
+        if (
+            mti not in AUTHORIZATION_REQUEST_MTIS
+            or not rrn
+            or fields.get("039")
+        ):
+            continue
+
+        request_start = transaction.get("start_line") or 0
+        candidate_responses = [
+            response
+            for response in responses_by_rrn.get(rrn, [])
+            if (response.get("start_line") or 0) > request_start
+        ]
+
+        if not candidate_responses:
+            continue
+
+        related_response = max(
+            candidate_responses,
+            key=lambda response: (
+                1
+                if response.get("mti") in FINAL_AUTHORIZATION_RESPONSE_MTIS
+                else 0,
+                response.get("start_line") or 0,
+                response.get("log_index") or 0,
+            ),
+        )
+
+        if not related_response:
+            continue
+
+        response_fields = {
+            field: value
+            for field, value in (related_response.get("fields") or {}).items()
+            if value
+        }
+        response_code = response_fields.get("039")
+
+        if not response_code:
+            continue
+
+        fields["039"] = response_code
+        transaction.setdefault("response_fields", response_fields)
+        transaction.setdefault(
+            "response_mti",
+            related_response.get("mti"),
+        )
+        transaction.setdefault(
+            "response_log_index",
+            related_response.get("log_index"),
+        )
+        transaction.setdefault(
+            "response_transaction_id",
+            related_response.get("transaction_id"),
+        )
+        transaction["related_response_backfilled"] = True
+        transaction["status"] = transaction_status(
+            fields,
+            transaction.get("log_story", []),
+            transaction.get("hsm_analysis"),
+        )
+        transaction["display_name"] = transaction_display_name(
+            index=transaction.get("log_index") or 0,
+            mti=transaction.get("mti"),
+            fields=fields,
+            hsm_analysis=transaction.get("hsm_analysis"),
+        )
+        transaction["observed_facts"] = observed_facts_for_transaction(
+            transaction
+        )
+
+
 def parse_log_transactions(
     text: str,
     source: str,
@@ -1074,6 +1253,10 @@ def parse_log_transactions(
         )
         log_story = parse_log_story(chunk["lines"])
         hsm_analysis = parse_hsm_analysis(chunk["lines"])
+
+        if mti in NETWORK_MANAGEMENT_MTIS:
+            continue
+
         transaction = {
             "transaction_id": f"transaction_{index}",
             "log_index": index,
@@ -1110,6 +1293,9 @@ def parse_log_transactions(
         )
         parsed_transactions.append(transaction)
 
+    merge_response_blocks_with_requests(parsed_transactions)
+    backfill_related_response_codes_by_rrn(parsed_transactions)
+
     return parsed_transactions
 
 
@@ -1129,6 +1315,20 @@ def build_statistics(
             if transaction.get("status") == "FAILED"
         ),
         "warning_transactions": sum(
+            1
+            for transaction in transactions
+            if transaction.get("status") == "WARNING"
+        ),
+        "no_response_transactions": sum(
+            1
+            for transaction in transactions
+            if (
+                transaction.get("mti") in AUTHORIZATION_REQUEST_MTIS
+                and not transaction.get("response_mti")
+                and not (transaction.get("fields") or {}).get("039")
+            )
+        ),
+        "alert_transactions": sum(
             1
             for transaction in transactions
             if transaction.get("status") == "WARNING"

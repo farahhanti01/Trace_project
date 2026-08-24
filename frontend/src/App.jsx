@@ -7,6 +7,7 @@ import AgentSelector, { AGENTS } from "./components/AgentSelector";
 import FileUpload from "./components/UploadArea";
 import MessageInput from "./components/ChatInput";
 import ChatMessage from "./components/ChatMessage";
+import { DocumentPreviewPanel } from "./components/AIResponseCard";
 import AdminDocumentsPage from "./components/AdminDocumentsPage";
 
 
@@ -15,15 +16,188 @@ import {
   createMessage,
   deleteConversation,
   getConversations,
+  getConversationDocuments,
   getConversationMessages,
   getDocuments,
   sendChatMessage,
+  updateConversation,
   uploadFiles,
 } from "./services/api";
 
 
+const SIDEBAR_WIDTH_STORAGE_KEY = "trace.sidebar.width";
+const SIDEBAR_DEFAULT_WIDTH = 340;
+const SIDEBAR_MIN_WIDTH = 280;
+const SIDEBAR_MAX_WIDTH = 560;
+
+
+function clampSidebarWidth(value) {
+  return Math.min(
+    SIDEBAR_MAX_WIDTH,
+    Math.max(SIDEBAR_MIN_WIDTH, Math.round(value)),
+  );
+}
+
+
+function initialSidebarWidth() {
+  if (typeof window === "undefined") {
+    return SIDEBAR_DEFAULT_WIDTH;
+  }
+
+  const savedWidth = Number(window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
+
+  return Number.isFinite(savedWidth)
+    ? clampSidebarWidth(savedWidth)
+    : SIDEBAR_DEFAULT_WIDTH;
+}
+
+
 function makeId() {
   return Math.random().toString(36).slice(2, 10);
+}
+
+function displayMessageContent(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_error) {
+    return String(value);
+  }
+}
+
+function normalizeConversationTitleSource(text) {
+  return text
+    .replace(/#[^\s]+/g, " ")
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function truncateTitle(title, maxLength = 34) {
+  if (title.length <= maxLength) return title;
+
+  const shortened = title.slice(0, maxLength).replace(/\s+\S*$/, "");
+  return `${shortened || title.slice(0, maxLength)}...`;
+}
+
+function documentDisplayName(document) {
+  return String(document?.name ?? document?.original_filename ?? "").trim();
+}
+
+function isTraceFilename(filename) {
+  return /\.(?:trc\d*|log|txt)$/i.test(filename);
+}
+
+function traceTitleSuffix(files = [], references = []) {
+  const traceNames = [
+    ...files.map((file) => file?.name ?? ""),
+    ...references.map(documentDisplayName),
+  ]
+    .filter(Boolean)
+    .filter(isTraceFilename);
+
+  if (traceNames.length === 0) return "";
+
+  const firstTrace = traceNames[0].replace(/\.[^.]+$/, "");
+  const suffix = traceNames.length > 1
+    ? `${firstTrace} +${traceNames.length - 1}`
+    : firstTrace;
+
+  return truncateTitle(suffix, 28);
+}
+
+function withTraceSuffix(title, files = [], references = []) {
+  const suffix = traceTitleSuffix(files, references);
+
+  if (!suffix) return title;
+
+  return truncateTitle(`${title} - ${suffix}`, 58);
+}
+
+function buildConversationTitle(prompt, agent, files = [], references = []) {
+  const cleaned = normalizeConversationTitleSource(prompt);
+  const normalized = cleaned.toLowerCase();
+  const fieldMatch = normalized.match(/\b(?:field|fld|champ)\s*\(?0*(\d+(?:\.\d+)?)\)?\b/);
+
+  if (normalized.includes("hsm") || normalized.includes("hsmresultcode")) {
+    return withTraceSuffix("Analyse HSM", files, references);
+  }
+
+  if (fieldMatch) {
+    const fieldNumber = fieldMatch[1].includes(".")
+      ? fieldMatch[1]
+      : fieldMatch[1].padStart(3, "0");
+
+    if (
+      normalized.includes("code")
+      || normalized.includes("valeur")
+      || normalized.includes("signification")
+      || normalized.includes("tableau")
+    ) {
+      return withTraceSuffix(`Codes Field ${fieldNumber}`, files, references);
+    }
+
+    return withTraceSuffix(`Field ${fieldNumber}`, files, references);
+  }
+
+  if (
+    normalized.includes("analyse")
+    && (
+      normalized.includes("trace")
+      || normalized.includes("log")
+      || normalized.includes("transaction")
+    )
+  ) {
+    if (
+      normalized.includes("echec")
+      || normalized.includes("failed")
+      || normalized.includes("erreur")
+      || normalized.includes("error")
+    ) {
+      return withTraceSuffix("Transactions en echec", files, references);
+    }
+
+    return withTraceSuffix("Analyse de trace", files, references);
+  }
+
+  if (
+    normalized.includes("resume")
+    || normalized.includes("resumer")
+    || normalized.includes("presente")
+    || normalized.includes("document")
+    || normalized.includes("pdf")
+  ) {
+    return withTraceSuffix(
+      agent === "log" ? "Analyse documentaire" : "Resume document",
+      files,
+      references,
+    );
+  }
+
+  const words = cleaned
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((word) => word.length > 2)
+    .slice(0, 5);
+
+  return withTraceSuffix(
+    truncateTitle(words.join(" ") || "Nouvelle discussion"),
+    files,
+    references,
+  );
+}
+
+function sortConversations(conversations) {
+  return [...conversations].sort((a, b) => {
+    if (Boolean(a.pinned) !== Boolean(b.pinned)) {
+      return a.pinned ? -1 : 1;
+    }
+
+    return new Date(b.updated_at ?? 0) - new Date(a.updated_at ?? 0);
+  });
 }
 
 
@@ -32,9 +206,11 @@ export default function App() {
   const [activeId, setActiveId] = useState(null);
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
   const [viewMode, setViewMode] = useState("chat");
 
   const [messagesByConv, setMessagesByConv] = useState({});
+  const [loadingMessagesByConv, setLoadingMessagesByConv] = useState({});
   const [agentByConv, setAgentByConv] = useState({});
   const [filesByConv, setFilesByConv] = useState({});
   const [referencesByConv, setReferencesByConv] = useState({});
@@ -48,15 +224,25 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [showScrollToBottom, setShowScrollToBottom] =
     useState(false);
+  const [documentPreview, setDocumentPreview] = useState(null);
   const [loadingConversations, setLoadingConversations] =
     useState(true);
 
   const scrollRef = useRef(null);
   const textareaRef = useRef(null);
+  const sidebarResizeRef = useRef({
+    dragging: false,
+    startX: 0,
+    startWidth: SIDEBAR_DEFAULT_WIDTH,
+    lastWidth: SIDEBAR_DEFAULT_WIDTH,
+  });
 
   const activeMessages = activeId
     ? messagesByConv[activeId] ?? []
     : [];
+  const loadingActiveMessages = Boolean(
+    activeId && loadingMessagesByConv[activeId],
+  );
 
   const activeAgent = activeId
     ? agentByConv[activeId] ?? "documentation"
@@ -72,7 +258,61 @@ export default function App() {
 
   const showEmpty = !activeId;
 
-  
+  useEffect(() => {
+    function handleSidebarResizeMove(event) {
+      if (!sidebarResizeRef.current.dragging) return;
+
+      const nextWidth = clampSidebarWidth(
+        sidebarResizeRef.current.startWidth
+        + event.clientX
+        - sidebarResizeRef.current.startX,
+      );
+
+      sidebarResizeRef.current.lastWidth = nextWidth;
+      setSidebarWidth(nextWidth);
+    }
+
+    function handleSidebarResizeEnd() {
+      if (!sidebarResizeRef.current.dragging) return;
+
+      sidebarResizeRef.current.dragging = false;
+      document.body.classList.remove("sidebar-resizing");
+      window.localStorage.setItem(
+        SIDEBAR_WIDTH_STORAGE_KEY,
+        String(sidebarResizeRef.current.lastWidth),
+      );
+    }
+
+    window.addEventListener("mousemove", handleSidebarResizeMove);
+    window.addEventListener("mouseup", handleSidebarResizeEnd);
+
+    return () => {
+      window.removeEventListener("mousemove", handleSidebarResizeMove);
+      window.removeEventListener("mouseup", handleSidebarResizeEnd);
+      document.body.classList.remove("sidebar-resizing");
+    };
+  }, []);
+
+  function handleSidebarResizeStart(event) {
+    event.preventDefault();
+    sidebarResizeRef.current = {
+      dragging: true,
+      startX: event.clientX,
+      startWidth: sidebarWidth,
+      lastWidth: sidebarWidth,
+    };
+    document.body.classList.add("sidebar-resizing");
+  }
+
+  function handleSidebarResizeReset() {
+    sidebarResizeRef.current.lastWidth = SIDEBAR_DEFAULT_WIDTH;
+    setSidebarWidth(SIDEBAR_DEFAULT_WIDTH);
+    window.localStorage.setItem(
+      SIDEBAR_WIDTH_STORAGE_KEY,
+      String(SIDEBAR_DEFAULT_WIDTH),
+    );
+  }
+
 
   /*
    * Load conversations from MongoDB when the page opens.
@@ -84,7 +324,7 @@ export default function App() {
 
         const data = await getConversations();
 
-        setConversations(data);
+        setConversations(sortConversations(data));
 
         const agents = {};
 
@@ -109,16 +349,25 @@ export default function App() {
 
 
   /*
-   * Load extracted Documentation Agent files used by # mentions.
+   * Load extracted files that can be referenced with @ mentions.
    */
   async function loadReferenceDocuments() {
     try {
-      const documents = await getDocuments({
-        agent: "documentation",
-        status: "extracted",
-      });
+      const globalDocuments = (
+        await getDocuments({
+          status: "extracted",
+        })
+      ).filter(isGlobalReferenceDocument);
+      const conversationDocuments = activeId
+        ? await getConversationDocuments(activeId)
+        : [];
 
-      setReferenceDocuments(documents);
+      setReferenceDocuments(uniqueDocumentsByFilename(
+        [
+          ...conversationDocuments,
+          ...globalDocuments,
+        ].filter((document) => document.status === "extracted"),
+      ));
     } catch (error) {
       console.error(
         "Failed to load reference documents:",
@@ -127,10 +376,47 @@ export default function App() {
     }
   }
 
+function isGlobalReferenceDocument(document) {
+    const extension = String(document.extension ?? "").toLowerCase();
+    const imageExtensions = new Set([
+      ".png",
+      ".jpg",
+      ".jpeg",
+      ".webp",
+      ".bmp",
+      ".tif",
+      ".tiff",
+    ]);
+
+    return (
+      extension === ".pdf"
+      || extension === ".xlsx"
+      || extension === ".docx"
+      || imageExtensions.has(extension)
+    );
+  }
+
+  function uniqueDocumentsByFilename(documents = []) {
+    const seen = new Set();
+
+    return documents.filter((document) => {
+      const key = String(document.original_filename ?? "")
+        .trim()
+        .toLowerCase();
+
+      if (!key || seen.has(key)) {
+        return false;
+      }
+
+      seen.add(key);
+      return true;
+    });
+  }
+
 
   useEffect(() => {
     loadReferenceDocuments();
-  }, []);
+  }, [activeId]);
 
 
   /*
@@ -139,6 +425,10 @@ export default function App() {
   useEffect(() => {
     textareaRef.current?.focus();
   }, [activeId]);
+
+  useEffect(() => {
+    setDocumentPreview(null);
+  }, [activeId, viewMode]);
 
 
   /*
@@ -238,6 +528,11 @@ export default function App() {
   async function handleSelectConversation(id) {
     setViewMode("chat");
     setActiveId(id);
+    setDocumentPreview(null);
+    setLoadingMessagesByConv((previous) => ({
+      ...previous,
+      [id]: true,
+    }));
 
     const selectedConversation = conversations.find(
       (conversation) => conversation.id === id,
@@ -264,6 +559,11 @@ export default function App() {
         "Failed to load conversation messages:",
         error,
       );
+    } finally {
+      setLoadingMessagesByConv((previous) => ({
+        ...previous,
+        [id]: false,
+      }));
     }
   }
 
@@ -331,6 +631,52 @@ export default function App() {
     }
   }
 
+  async function handleTogglePinConversation(id) {
+    const conversation = conversations.find(
+      (item) => item.id === id,
+    );
+
+    if (!conversation) return;
+
+    const nextPinned = !conversation.pinned;
+
+    setConversations((previous) => sortConversations(
+      previous.map((item) => (
+        item.id === id
+          ? { ...item, pinned: nextPinned }
+          : item
+      )),
+    ));
+
+    try {
+      const updatedConversation = await updateConversation(
+        id,
+        { pinned: nextPinned },
+      );
+
+      setConversations((previous) => sortConversations(
+        previous.map((item) => (
+          item.id === id
+            ? updatedConversation
+            : item
+        )),
+      ));
+    } catch (error) {
+      console.error(
+        "Failed to pin conversation:",
+        error,
+      );
+
+      setConversations((previous) => sortConversations(
+        previous.map((item) => (
+          item.id === id
+            ? { ...item, pinned: conversation.pinned }
+            : item
+        )),
+      ));
+    }
+  }
+
 
   /*
    * Send the user message, create the conversation when needed,
@@ -339,7 +685,20 @@ export default function App() {
   async function handleSend() {
     const text = input.trim();
 
-    if (!text || sending) return;
+    const hasPendingFiles = activeFiles.length > 0 || draftFiles.length > 0;
+    const hasPendingReferences = (
+      activeReferences.length > 0
+      || draftReferences.length > 0
+    );
+
+    if (
+      sending
+      || (
+        !text
+        && !hasPendingFiles
+        && !hasPendingReferences
+      )
+    ) return;
 
     setSending(true);
     setInput("");
@@ -354,10 +713,12 @@ export default function App() {
        * Create a MongoDB conversation when this is a new chat.
        */
       if (!convId) {
-        const title =
-          text.length > 40
-            ? `${text.slice(0, 40)}…`
-            : text;
+        const title = buildConversationTitle(
+          text,
+          draftAgent,
+          draftFiles,
+          draftReferences,
+        );
 
         const createdConversation =
           await createConversation({
@@ -370,10 +731,10 @@ export default function App() {
         selectedFiles = draftFiles;
         selectedReferences = draftReferences;
 
-        setConversations((previous) => [
+        setConversations((previous) => sortConversations([
           createdConversation,
           ...previous,
-        ]);
+        ]));
 
         setAgentByConv((previous) => ({
           ...previous,
@@ -454,12 +815,18 @@ export default function App() {
       );
 
       /*
-      * Display the user message.
-      */
+       * Display the user message.
+       */
+      const messageText = text || (
+        selectedFiles.length > 0
+          ? "Analyse les fichiers joints."
+          : "Analyse les documents references."
+      );
+
       const localUserMessage = {
         id: makeId(),
         role: "user",
-        content: text,
+        content: messageText,
         structured: null,
         attachments: [
           ...attachments,
@@ -481,7 +848,7 @@ export default function App() {
       await createMessage({
         conversationId: convId,
         role: "user",
-        content: text,
+        content: messageText,
         structured: null,
         attachments: [
           ...attachments,
@@ -509,7 +876,7 @@ export default function App() {
        * Ask the backend chat endpoint.
        */
       const response = await sendChatMessage({
-        question: text,
+        question: messageText,
         agent: selectedAgent,
         conversationId: convId,
         referencedDocumentIds: [
@@ -617,6 +984,7 @@ export default function App() {
       className={sidebarOpen
         ? "app-shell"
         : "app-shell sidebar-hidden"}
+      style={{ "--sidebar-width": `${sidebarWidth}px` }}
     >
 
         <Sidebar
@@ -626,8 +994,11 @@ export default function App() {
           onSelect={handleSelectConversation}
           onNew={startNew}
           onDelete={handleDeleteConversation}
+          onTogglePin={handleTogglePinConversation}
           onAdmin={() => setViewMode("admin")}
           adminActive={viewMode === "admin"}
+          onResizeStart={handleSidebarResizeStart}
+          onResizeReset={handleSidebarResizeReset}
       /> 
 
       {/* <div className={sidebarOpen ? "app-shell" : "app-shell sidebar-hidden"}>
@@ -641,6 +1012,8 @@ export default function App() {
           }
         />
 
+        <div className={`chat-workspace${documentPreview && viewMode !== "admin" ? " chat-workspace--with-preview" : ""}`}>
+          <div className="chat-workspace__chat">
         <main
           ref={scrollRef}
           className="content-area"
@@ -659,6 +1032,16 @@ export default function App() {
                 Loading conversations…
               </div>
             </div>
+          ) : loadingActiveMessages ? (
+            <div className="chat-loading">
+              <div className="chat-loading__avatar">
+                â˜…
+              </div>
+
+              <div className="chat-loading__bubble">
+                Chargement de la conversationâ€¦
+              </div>
+            </div>
           ) : showEmpty ? (
             <div className="workspace">
               <AgentSelector
@@ -673,13 +1056,27 @@ export default function App() {
             </div>
           ) : (
             <section className="conversation-panel">
-              {activeMessages.map((message) => (
+              {activeMessages.map((message, index) => {
+                const previousUserMessage = activeMessages
+                  .slice(0, index)
+                  .reverse()
+                  .find((item) => item.role === "user");
+
+                return (
                 <ChatMessage
                   key={message.id}
                   message={message}
                   onEditPrompt={handleEditPrompt}
+                  onDocumentPreview={setDocumentPreview}
+                  onRetry={
+                    message.role === "assistant" && previousUserMessage
+                      ? () => handleEditPrompt(displayMessageContent(previousUserMessage.content))
+                      : undefined
+                  }
+                  onSuggestedPrompt={handleEditPrompt}
                 />
-              ))}
+                );
+              })}
 
               {sending && (
                 <div className="chat-loading">
@@ -711,40 +1108,18 @@ export default function App() {
 
         {viewMode !== "admin" && (
         <footer className="composer-footer">
-          {activeId && (
-            <div className="composer-agent-switch">
-              {Object.entries(AGENTS).map(([id, agent]) => {
-                const Icon = agent.icon;
-                const active = activeAgent === id;
-
-                return (
-                  <button
-                    key={id}
-                    type="button"
-                    className={
-                      active
-                        ? "composer-agent-switch__button composer-agent-switch__button--active"
-                        : "composer-agent-switch__button"
-                    }
-                    onClick={() => setActiveAgent(id)}
-                  >
-                    <Icon className="composer-agent-switch__icon" />
-                    <span>{agent.name}</span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-
           <MessageInput
             ref={textareaRef}
             value={input}
             onChange={setInput}
             onSubmit={handleSend}
+            agents={AGENTS}
+            activeAgent={activeAgent}
+            onAgentChange={setActiveAgent}
             files={activeFiles}
             referenceDocuments={referenceDocuments}
             selectedReferences={activeReferences}
-            enableReferences={activeAgent === "log"}
+            enableReferences={["documentation", "log"].includes(activeAgent)}
             disabled={sending}
             onReferenceSelect={(document) => {
               if (activeId) {
@@ -823,6 +1198,17 @@ export default function App() {
           />
         </footer>
         )}
+          </div>
+
+          {viewMode !== "admin" && documentPreview && (
+            <aside className="chat-workspace__preview">
+              <DocumentPreviewPanel
+                preview={documentPreview}
+                onClose={() => setDocumentPreview(null)}
+              />
+            </aside>
+          )}
+        </div>
       </div>
     </div>
   );

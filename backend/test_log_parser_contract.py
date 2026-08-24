@@ -21,6 +21,125 @@ class LogParserContractTests(unittest.TestCase):
     def test_mti_0210_uses_authorization_response_label(self):
         self.assertEqual(mti_label("0210"), "Authorization Response")
 
+    def test_network_management_mtis_are_not_returned_as_transactions(self):
+        text = "\n".join(
+            [
+                "2014 00000001 6| Start DumpVisa()",
+                "2014 00000002 6| - M.T.I : [0800]",
+                "2014 00000003 6| - FLD (037) (012) [460400004152]",
+                "2014 00000004 6| End DumpVisa(OK)",
+                "2014 00000005 6| Start DumpVisa()",
+                "2014 00000006 6| - M.T.I : [0810]",
+                "2014 00000007 6| - FLD (037) (012) [460400004152]",
+                "2014 00000008 6| - FLD (039) (002) [00]",
+                "2014 00000009 6| End DumpVisa(OK)",
+                "2014 00000010 6| Start DumpVisa()",
+                "2014 00000011 6| - M.T.I : [0100]",
+                "2014 00000012 6| - FLD (037) (012) [432915275372]",
+                "2014 00000013 6| End DumpVisa(OK)",
+            ]
+        )
+
+        transactions = parse_log_transactions(text, "trace.txt")
+
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]["mti"], "0100")
+        self.assertEqual(transactions[0]["fields"]["037"], "432915275372")
+
+    def test_response_block_enriches_matching_request_by_rrn(self):
+        text = "\n".join(
+            [
+                "2014 00000001 6| Start DumpVisa()",
+                "2014 00000002 6| - M.T.I : [0100]",
+                "2014 00000003 6| - FLD (003) (006) [009000]",
+                "2014 00000004 6| - FLD (037) (012) [432915275372]",
+                "2014 00000005 6| Start GetService()",
+                "2014 00000006 6| End GetService(OK)",
+                "2014 00000007 6| End DumpVisa(OK)",
+                "2014 00000008 6| Start DumpVisa()",
+                "2014 00000009 6| - M.T.I : [1110]",
+                "2014 00000010 6| - FLD (037) (012) [432915275372]",
+                "2014 00000011 6| - FLD (039) (003) [116]",
+                "2014 00000012 6| End DumpVisa(OK)",
+            ]
+        )
+
+        transactions = parse_log_transactions(text, "trace.txt")
+
+        self.assertEqual(transactions[0]["mti"], "0100")
+        self.assertEqual(transactions[0]["response_mti"], "1110")
+        self.assertEqual(transactions[0]["fields"]["039"], "116")
+        self.assertEqual(transactions[0]["status"], "FAILED")
+        self.assertEqual(
+            transactions[1]["merged_into_transaction_id"],
+            transactions[0]["transaction_id"],
+        )
+
+    def test_1110_response_enriches_matching_1100_request_by_rrn(self):
+        text = "\n".join(
+            [
+                "1301 18581070 00112610 00112635|4| Start DumpVisa()",
+                "1301 18581070 00112610 00112635|4| - M.T.I      : [1100]",
+                "1301 18581070 00112610 00112635|4| - FLD (002) : (016) : [5556010000838579]",
+                "1301 18581070 00112610 00112635|4| - FLD (003) : (006) : [000000]",
+                "1301 18581070 00112610 00112635|4| - FLD (037) : (012) : [601318093092]",
+                "1301 18581070 00112610 00112635|4| End DumpVisa(OK)",
+                "1301 18581080 00112610 00112635|4| Start DumpVisa()",
+                "1301 18581080 00112610 00112635|4| - M.T.I      : [1110]",
+                "1301 18581080 00112610 00112635|4| - FLD (037) : (012) : [601318093092]",
+                "1301 18581080 00112610 00112635|4| - FLD (039) : (003) : [116]",
+                "1301 18581080 00112610 00112635|4| End DumpVisa(OK)",
+            ]
+        )
+
+        transactions = parse_log_transactions(text, "trace.txt")
+
+        self.assertEqual(transactions[0]["mti"], "1100")
+        self.assertEqual(transactions[0]["response_mti"], "1110")
+        self.assertEqual(transactions[0]["fields"]["039"], "116")
+        self.assertEqual(transactions[0]["status"], "FAILED")
+        self.assertEqual(
+            transactions[1]["merged_into_transaction_id"],
+            transactions[0]["transaction_id"],
+        )
+
+    def test_related_requests_with_same_rrn_receive_later_response_code(self):
+        text = "\n".join(
+            [
+                "1301 185809816 00112610 00112627|4| Start DumpVisa()",
+                "1301 185809816 00112610 00112627|4| - M.T.I      : [0100]",
+                "1301 185809816 00112610 00112627|4| - FLD (037) : (012) : [601318093092]",
+                "1301 185809816 00112610 00112627|4| End DumpVisa(OK)",
+                "1301 185809820 00112610 00112627|4| Start DumpVisa()",
+                "1301 185809820 00112610 00112627|4| - M.T.I      : 1100",
+                "1301 185809820 00112610 00112627|4| - FLD (037) : (012) : [601318093092]",
+                "1301 185809820 00112610 00112627|4| Start GetOriginalAuthData()",
+                "1301 185809820 00112610 00112627|4| End GetOriginalAuthData(NOK, -1)",
+                "1301 185809820 00112610 00112627|4| End DumpVisa(OK)",
+                "1301 185809984 00112610 00112627|4| Start DumpVisa()",
+                "1301 185809984 00112610 00112627|4| - M.T.I      : 1100",
+                "1301 185809985 00112610 00112627|4| - FLD (037) : (012) : [601318093092]",
+                "1301 185809985 00112610 00112627|4| End DumpVisa(OK)",
+                "1301 185810808 00112610 00112635|4| Start DumpVisa()",
+                "1301 185810808 00112610 00112635|4| - M.T.I      : 1110",
+                "1301 185810808 00112610 00112635|4| - FLD (037) : (012) : [601318093092]",
+                "1301 185810808 00112610 00112635|4| - FLD (039) : (003) : [116]",
+                "1301 185810808 00112610 00112635|4| End DumpVisa(OK)",
+                "1301 185810870 00112610 00112635|4| Start DumpVisa()",
+                "1301 185810870 00112610 00112635|4| - M.T.I      : [0110]",
+                "1301 185810870 00112610 00112635|4| - FLD (037)   (012)    [601318093092]",
+                "1301 185810871 00112610 00112635|4| - FLD (039)   (002)    [51]",
+                "1301 185810871 00112610 00112635|4| End DumpVisa(OK)",
+            ]
+        )
+
+        transactions = parse_log_transactions(text, "trace.txt")
+
+        self.assertEqual(transactions[1]["mti"], "1100")
+        self.assertEqual(transactions[1]["fields"]["039"], "51")
+        self.assertEqual(transactions[1]["response_mti"], "0110")
+        self.assertTrue(transactions[1]["related_response_backfilled"])
+
     def test_parse_0200_transaction_keeps_same_request_logic(self):
         text = "\n".join(
             [
@@ -84,6 +203,22 @@ class LogParserContractTests(unittest.TestCase):
         self.assertEqual(transactions[0]["mti"], "1210")
         self.assertEqual(transactions[0]["fields"]["039"], "000")
         self.assertEqual(transactions[0]["status"], "SUCCESS")
+
+    def test_parser_keeps_additional_iso_fields_for_compliance_checks(self):
+        text = "\n".join(
+            [
+                "2014 00000001 6| Start DumpVisa()",
+                "2014 00000002 6| - M.T.I : [0110]",
+                "2014 00000003 6| - FLD (037) (012) [432915275372]",
+                "2014 00000004 6| - FLD (039) (002) [00]",
+                "2014 00000005 6| - FLD (044) (006) [123456]",
+                "2014 00000006 6| End DumpVisa(OK)",
+            ]
+        )
+
+        transactions = parse_log_transactions(text, "trace.txt")
+
+        self.assertEqual(transactions[0]["fields"]["044"], "123456")
 
     def test_function_return_zero_with_empty_second_arg_is_ok(self):
         text = "\n".join(

@@ -1,5 +1,6 @@
 import React, {
   forwardRef,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -7,12 +8,77 @@ import React, {
 
 import {
   ArrowUp,
+  ChevronDown,
   FileText,
   Paperclip,
   X,
 } from "lucide-react";
 
 import { Button } from "./ui/Button";
+
+
+function isImageFile(file) {
+  return String(file?.type ?? "").startsWith("image/");
+}
+
+
+function documentName(document) {
+  return String(
+    document?.original_filename
+    ?? document?.name
+    ?? document?.stored_filename
+    ?? "Document",
+  );
+}
+
+
+function extensionFromMimeType(mimeType) {
+  const normalized = String(mimeType ?? "").toLowerCase();
+
+  if (normalized === "image/jpeg") return "jpg";
+  if (normalized === "image/webp") return "webp";
+  if (normalized === "image/bmp") return "bmp";
+  if (normalized === "image/tiff") return "tiff";
+
+  return "png";
+}
+
+
+function pastedImageName(file, index) {
+  const extension = extensionFromMimeType(file.type);
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\..+$/, "");
+
+  return `screenshot-${timestamp}-${index + 1}.${extension}`;
+}
+
+
+function PendingImagePreview({ file }) {
+  const [previewUrl, setPreviewUrl] = useState("");
+
+  useEffect(() => {
+    const objectUrl = URL.createObjectURL(file);
+    setPreviewUrl(objectUrl);
+
+    return () => {
+      URL.revokeObjectURL(objectUrl);
+    };
+  }, [file]);
+
+  if (!previewUrl) {
+    return <FileText className="composer__pending-file-icon" />;
+  }
+
+  return (
+    <img
+      src={previewUrl}
+      alt=""
+      className="composer__pending-image"
+    />
+  );
+}
 
 
 export const MessageInput = forwardRef(
@@ -30,8 +96,11 @@ export const MessageInput = forwardRef(
       referenceDocuments = [],
       selectedReferences = [],
       enableReferences = false,
+      agents = {},
+      activeAgent = "",
+      onAgentChange,
       placeholder =
-        "Ask about a specification, transaction flow, or log...",
+        "Pose une question sur une spécification, un flux ou une trace...",
     },
     ref,
   ) {
@@ -42,8 +111,8 @@ export const MessageInput = forwardRef(
     const referenceMatches = useMemo(() => {
       const query = referenceQuery.toLowerCase();
 
-      return referenceDocuments
-        .filter((document) => {
+      return referenceDocuments.filter((document) => {
+          const name = documentName(document);
           const alreadySelected = selectedReferences.some(
             (reference) => reference.id === document.id,
           );
@@ -52,11 +121,10 @@ export const MessageInput = forwardRef(
             return false;
           }
 
-          return document.original_filename
+          return name
             .toLowerCase()
             .includes(query);
-        })
-        .slice(0, 8);
+        });
     }, [
       referenceDocuments,
       referenceQuery,
@@ -70,7 +138,14 @@ export const MessageInput = forwardRef(
       ) {
         event.preventDefault();
 
-        if (!disabled && value.trim()) {
+        if (
+          !disabled
+          && (
+            value.trim()
+            || files.length > 0
+            || selectedReferences.length > 0
+          )
+        ) {
           onSubmit();
         }
       }
@@ -86,6 +161,31 @@ export const MessageInput = forwardRef(
       event.target.value = "";
     }
 
+    function handlePaste(event) {
+      if (disabled) return;
+
+      const items = Array.from(event.clipboardData?.items ?? []);
+      const pastedImages = items
+        .filter((item) => item.kind === "file")
+        .map((item) => item.getAsFile())
+        .filter((file) => file && isImageFile(file))
+        .map((file, index) => new File(
+          [file],
+          file.name || pastedImageName(file, index),
+          {
+            type: file.type || "image/png",
+            lastModified: Date.now(),
+          },
+        ));
+
+      if (pastedImages.length === 0) {
+        return;
+      }
+
+      event.preventDefault();
+      onAttach(pastedImages);
+    }
+
     function openFilePicker() {
       fileInputRef.current?.click();
     }
@@ -99,7 +199,7 @@ export const MessageInput = forwardRef(
         return;
       }
 
-      const match = nextValue.match(/(?:^|\s)#([^\s#]*)$/);
+      const match = nextValue.match(/(?:^|\s)@([^\s@]*)$/);
 
       if (match) {
         setReferenceQuery(match[1] ?? "");
@@ -111,10 +211,10 @@ export const MessageInput = forwardRef(
 
     function selectReference(document) {
       const nextValue = value.replace(
-        /(?:^|\s)#([^\s#]*)$/,
+        /(?:^|\s)@([^\s@]*)$/,
         (match) => {
           const prefix = match.startsWith(" ") ? " " : "";
-          return `${prefix}#${document.original_filename} `;
+          return prefix;
         },
       );
 
@@ -137,16 +237,16 @@ export const MessageInput = forwardRef(
 
                 <span
                   className="composer__reference-file-name"
-                  title={document.original_filename}
+                  title={documentName(document)}
                 >
-                  #{document.original_filename}
+                  @{documentName(document)}
                 </span>
 
                 {onRemoveReference && (
                   <button
                     type="button"
                     className="composer__pending-file-remove"
-                    aria-label={`Remove ${document.original_filename}`}
+                    aria-label={`Remove ${documentName(document)}`}
                     onClick={() => onRemoveReference(document.id)}
                   >
                     <X size={15} />
@@ -164,7 +264,11 @@ export const MessageInput = forwardRef(
                 key={`${file.name}-${file.lastModified}-${index}`}
                 className="composer__pending-file"
               >
-                <FileText className="composer__pending-file-icon" />
+                {isImageFile(file) ? (
+                  <PendingImagePreview file={file} />
+                ) : (
+                  <FileText className="composer__pending-file-icon" />
+                )}
 
                 <div className="composer__pending-file-details">
                   <span
@@ -208,7 +312,7 @@ export const MessageInput = forwardRef(
                     <FileText className="composer__reference-option-icon" />
 
                     <span className="composer__reference-option-name">
-                      {document.original_filename}
+                      {documentName(document)}
                     </span>
                   </button>
                 ))
@@ -221,22 +325,11 @@ export const MessageInput = forwardRef(
           )}
 
           <div className="composer__box">
-            <button
-              type="button"
-              className="composer__attach"
-              aria-label="Attach files"
-              title="Attach files"
-              disabled={disabled}
-              onClick={openFilePicker}
-            >
-              <Paperclip className="composer__attach-icon" />
-            </button>
-
             <input
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.log,.trc,.trc019,.trc068,text/plain"
+              accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.log,.trc,.trc019,.trc068,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,text/plain,image/*"
               className="composer__file-input"
               onChange={handleFileChange}
             />
@@ -250,20 +343,67 @@ export const MessageInput = forwardRef(
               disabled={disabled}
               onChange={handleInputChange}
               onKeyDown={handleKeyDown}
+              onPaste={handlePaste}
             />
 
-            <Button
-              type="button"
-              size="icon"
-              className="composer__send"
-              disabled={disabled || !value.trim()}
-              onClick={onSubmit}
-            >
-              <ArrowUp
-                className="composer__send-icon"
-                strokeWidth={2.5}
-              />
-            </Button>
+            <div className="composer__actions">
+              <div className="composer__actions-left">
+                <button
+                  type="button"
+                  className="composer__attach"
+                  aria-label="Attach files"
+                  title="Attach files"
+                  disabled={disabled}
+                  onClick={openFilePicker}
+                >
+                  <Paperclip className="composer__attach-icon" />
+                  <span>Joindre un document</span>
+                </button>
+
+                {Object.keys(agents).length > 0 && (
+                  <label className="composer__agent-select">
+                    <span>
+                      {agents[activeAgent]?.name ?? "Agent"}
+                    </span>
+                    <ChevronDown className="composer__agent-select-icon" />
+                    <select
+                      value={activeAgent}
+                      onChange={(event) =>
+                        onAgentChange?.(event.target.value)
+                      }
+                      disabled={disabled}
+                      aria-label="Choisir un agent"
+                    >
+                      {Object.entries(agents).map(([id, agent]) => (
+                        <option key={id} value={id}>
+                          {agent.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+              </div>
+
+              <Button
+                type="button"
+                size="icon"
+                className="composer__send"
+                disabled={
+                  disabled
+                  || (
+                    !value.trim()
+                    && files.length === 0
+                    && selectedReferences.length === 0
+                  )
+                }
+                onClick={onSubmit}
+              >
+                <ArrowUp
+                  className="composer__send-icon"
+                  strokeWidth={2.5}
+                />
+              </Button>
+            </div>
           </div>
         </div>
 

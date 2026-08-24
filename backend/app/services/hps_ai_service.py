@@ -4,6 +4,8 @@ import ssl
 import httpx
 import truststore
 from dotenv import load_dotenv
+from typing import Any
+
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 from openai import AsyncOpenAI
 
@@ -77,7 +79,7 @@ def get_ocean_client() -> AsyncOpenAI:
 
 
 async def call_hps_ai(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     temperature: float | None = None,
     frequency_penalty: float = 0.8,
     presence_penalty: float = 0.3,

@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -27,12 +28,24 @@ class MessageCreate(BaseModel):
 
 
 def serialize_message(document: dict) -> dict:
+    structured = (
+        document.get("structured")
+        or document.get("structured_response")
+        or document.get("answer")
+    )
+    if isinstance(structured, str):
+        try:
+            parsed_structured = json.loads(structured)
+            structured = parsed_structured if isinstance(parsed_structured, dict) else None
+        except json.JSONDecodeError:
+            structured = None
+
     return {
         "id": str(document["_id"]),
         "conversation_id": document["conversation_id"],
         "role": document["role"],
         "content": document.get("content", ""),
-        "structured": document.get("structured"),
+        "structured": structured,
         "created_at": document["created_at"],
         "attachments": document.get("attachments", []),
     }

@@ -1,3 +1,5 @@
+import logging
+import os
 from typing import Any, Literal
 
 from fastapi import FastAPI
@@ -8,6 +10,7 @@ from app.routes.conversations import router as conversations_router
 from app.routes.messages import router as messages_router
 from app.routes.documents import router as documents_router
 from app.routes.admin import router as admin_router
+from app.database import ensure_document_content_unit_indexes
 from app.services.documentation_agent_service import (
     answer_documentation_question,
 )
@@ -40,6 +43,25 @@ app.include_router(conversations_router)
 app.include_router(messages_router)
 app.include_router(documents_router)
 app.include_router(admin_router)
+
+if os.getenv("DEBUG_RAG", "").lower() in {"1", "true", "yes"}:
+    from app.routes.documentation_debug import router as documentation_debug_router
+
+    app.include_router(documentation_debug_router)
+
+
+logger = logging.getLogger(__name__)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    try:
+        await ensure_document_content_unit_indexes()
+    except Exception as error:
+        logger.exception(
+            "Unable to create document content unit indexes: %s",
+            error,
+        )
 
 AgentType = Literal["documentation", "log"]
 

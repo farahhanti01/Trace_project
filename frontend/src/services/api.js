@@ -85,6 +85,14 @@ export async function getDocuments({
   return parseResponse(response);
 }
 
+export async function getConversationDocuments(conversationId) {
+  const response = await fetch(
+    `${API_URL}/api/documents/conversation/${conversationId}`,
+  );
+
+  return parseResponse(response);
+}
+
 export async function getConversations() {
   const response = await fetch(`${API_URL}/api/conversations`);
   return parseResponse(response);
@@ -100,6 +108,18 @@ export async function createConversation({ title, agent }) {
       title,
       agent,
     }),
+  });
+
+  return parseResponse(response);
+}
+
+export async function updateConversation(conversationId, updates) {
+  const response = await fetch(`${API_URL}/api/conversations/${conversationId}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(updates),
   });
 
   return parseResponse(response);
@@ -226,6 +246,38 @@ export function getAdminDocumentDownloadUrl(documentId) {
 
 export function getAdminDocumentViewUrl(documentId) {
   return `${API_URL}/api/admin/documents/${documentId}/view`;
+}
+
+export function getAdminDocumentPagePreviewUrl(documentId, { page, search } = {}) {
+  const params = new URLSearchParams();
+
+  if (page !== undefined && page !== null) {
+    params.set("page", page);
+  }
+
+  if (search) {
+    params.set("search", search);
+  }
+
+  const query = params.toString();
+
+  return `${API_URL}/api/admin/documents/${documentId}/page-preview${query ? `?${query}` : ""}`;
+}
+
+export function getAdminDocumentHighlightedViewUrl(documentId, { page, search } = {}) {
+  const params = new URLSearchParams();
+
+  if (page !== undefined && page !== null) {
+    params.set("page", page);
+  }
+
+  if (search) {
+    params.set("search", search);
+  }
+
+  const query = params.toString();
+
+  return `${API_URL}/api/admin/documents/${documentId}/highlighted-view${query ? `?${query}` : ""}`;
 }
 
 export function getAdminDocumentPreviewUrl(documentId) {

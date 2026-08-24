@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import hashlib
+import logging
 import re
 
 import aiofiles
@@ -7,8 +9,11 @@ from bson import ObjectId
 from fastapi import HTTPException, UploadFile
 
 from app.database import (
+    document_content_units_collection,
+    document_facts_collection,
     document_sections_collection,
     documents_collection,
+    function_catalog_collection,
 )
 
 from app.services.extraction_service import (
@@ -26,6 +31,15 @@ from app.services.hps_ai_service import (
     HpsAiConfigurationError,
     HpsAiRequestError,
     create_hps_embeddings,
+)
+from app.services.document_fact_service import (
+    extract_document_facts,
+)
+from app.services.content_unit_service import (
+    ContentUnitExtractor,
+)
+from app.services.function_catalog_service import (
+    FunctionCatalogExtractor,
 )
 
 
@@ -50,6 +64,8 @@ DOCUMENT_STORAGE_ROOT.mkdir(
     parents=True,
     exist_ok=True,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def split_text_into_chunks(
@@ -287,6 +303,39 @@ def extract_field_metadata(
     return metadata
 
 
+def sha256_hex(
+    content: bytes,
+) -> str:
+    """Calcule une empreinte stable pour reconnaitre un fichier deja uploade."""
+
+    return hashlib.sha256(content).hexdigest()
+
+
+def duplicate_document_query(
+    *,
+    conversation_id: str,
+    agent: str,
+    extension: str,
+    file_hash: str,
+) -> dict:
+    """Construit la requete MongoDB utilisee pour detecter un doublon."""
+
+    return {
+        "conversation_id": conversation_id,
+        "agent": agent,
+        "extension": extension,
+        "file_hash": file_hash,
+        "status": {
+            "$in": [
+                "uploaded",
+                "extracting",
+                "extracted",
+                "extraction_pending",
+            ],
+        },
+    }
+
+
 async def add_embeddings_to_sections(
     section_documents: list[dict],
 ) -> str:
@@ -320,6 +369,94 @@ async def add_embeddings_to_sections(
     return "embedded"
 
 
+async def store_content_units_best_effort(
+    *,
+    document_id: ObjectId,
+    section_documents: list[dict],
+    document: dict | None,
+    fallback_filename: str,
+) -> int:
+    """Stocke les ContentUnits sans bloquer l'ingestion principale."""
+
+    try:
+        await document_content_units_collection.delete_many(
+            {
+                "document_id": str(document_id),
+            }
+        )
+        content_units = ContentUnitExtractor.extract(
+            sections=section_documents,
+            document=document or {
+                "_id": document_id,
+                "original_filename": fallback_filename,
+            },
+        )
+
+        if content_units:
+            await document_content_units_collection.insert_many(
+                content_units
+            )
+
+        return len(content_units)
+
+    except Exception as error:
+        await document_content_units_collection.delete_many(
+            {
+                "document_id": str(document_id),
+            }
+        )
+        logger.exception(
+            "ContentUnit extraction failed for document %s: %s",
+            document_id,
+            error,
+        )
+
+        return 0
+
+
+async def store_function_catalog_best_effort(
+    *,
+    document_id: ObjectId,
+    section_documents: list[dict],
+    document: dict | None,
+    fallback_filename: str,
+) -> int:
+    """Stocke un catalogue de fonctions sans bloquer l'ingestion principale."""
+
+    try:
+        await function_catalog_collection.delete_many(
+            {
+                "document_id": str(document_id),
+            }
+        )
+        entries = FunctionCatalogExtractor.extract(
+            sections=section_documents,
+            document=document or {
+                "_id": document_id,
+                "original_filename": fallback_filename,
+            },
+        )
+
+        if entries:
+            await function_catalog_collection.insert_many(entries)
+
+        return len(entries)
+
+    except Exception as error:
+        await function_catalog_collection.delete_many(
+            {
+                "document_id": str(document_id),
+            }
+        )
+        logger.exception(
+            "Function catalog extraction failed for document %s: %s",
+            document_id,
+            error,
+        )
+
+        return 0
+
+
 def serialize_document(document: dict) -> dict:
     return {
         "id": str(document["_id"]),
@@ -349,6 +486,8 @@ def serialize_document(document: dict) -> dict:
             "embedding_status",
             "unknown",
         ),
+        "file_hash": document.get("file_hash"),
+        "deduplicated": document.get("deduplicated", False),
         "extraction_error": document.get(
             "extraction_error"
         ),
@@ -363,7 +502,7 @@ def serialize_document(document: dict) -> dict:
 async def save_file_to_disk(
     upload_file: UploadFile,
     destination: Path,
-) -> int:
+) -> tuple[int, str]:
     """
     Save an uploaded file progressively.
 
@@ -371,6 +510,7 @@ async def save_file_to_disk(
     """
 
     total_size = 0
+    digest = hashlib.sha256()
 
     try:
         async with aiofiles.open(
@@ -396,6 +536,7 @@ async def save_file_to_disk(
                         ),
                     )
 
+                digest.update(chunk)
                 await output.write(chunk)
 
     except Exception:
@@ -407,13 +548,13 @@ async def save_file_to_disk(
     finally:
         await upload_file.close()
 
-    return total_size
+    return total_size, digest.hexdigest()
 
 
 async def save_text_file_to_disk_masked(
     upload_file: UploadFile,
     destination: Path,
-) -> int:
+) -> tuple[int, str]:
     content = await upload_file.read()
 
     try:
@@ -423,6 +564,7 @@ async def save_text_file_to_disk_masked(
 
     masked_text = mask_iso_field_002(text)
     encoded = masked_text.encode("utf-8")
+    file_hash = sha256_hex(encoded)
 
     if len(encoded) > MAX_FILE_SIZE:
         raise HTTPException(
@@ -444,7 +586,7 @@ async def save_text_file_to_disk_masked(
     finally:
         await upload_file.close()
 
-    return len(encoded)
+    return len(encoded), file_hash
 
 
 async def extract_and_store_document(
@@ -457,6 +599,11 @@ async def extract_and_store_document(
     """
 
     now = datetime.now(timezone.utc)
+    document = await documents_collection.find_one(
+        {
+            "_id": document_id,
+        }
+    )
 
     await documents_collection.update_one(
         {
@@ -481,6 +628,21 @@ async def extract_and_store_document(
                 "document_id": str(document_id),
             }
         )
+        await document_content_units_collection.delete_many(
+            {
+                "document_id": str(document_id),
+            }
+        )
+        await document_facts_collection.delete_many(
+            {
+                "document_id": str(document_id),
+            }
+        )
+        await function_catalog_collection.delete_many(
+            {
+                "document_id": str(document_id),
+            }
+        )
 
         section_documents = []
 
@@ -500,6 +662,8 @@ async def extract_and_store_document(
                         "field_name",
                         "content_type",
                         "page_document",
+                        "cells",
+                        "row_number",
                     )
                     if section.get(key) is not None
                 }
@@ -556,8 +720,38 @@ async def extract_and_store_document(
             await document_sections_collection.insert_many(
                 section_documents
             )
+            await store_content_units_best_effort(
+                document_id=document_id,
+                section_documents=section_documents,
+                document=document,
+                fallback_filename=file_path.name,
+            )
+            function_catalog_count = (
+                0
+                if is_trace_extension(file_path.suffix.lower())
+                else await store_function_catalog_best_effort(
+                    document_id=document_id,
+                    section_documents=section_documents,
+                    document=document,
+                    fallback_filename=file_path.name,
+                )
+            )
         else:
             embedding_status = "skipped"
+            function_catalog_count = 0
+
+        structured_facts = extract_document_facts(
+            sections=section_documents,
+            document=document or {
+                "_id": document_id,
+                "original_filename": file_path.name,
+            },
+        )
+
+        if structured_facts:
+            await document_facts_collection.insert_many(
+                structured_facts
+            )
 
         await documents_collection.update_one(
             {
@@ -580,6 +774,10 @@ async def extract_and_store_document(
                     "section_count": len(
                         section_documents
                     ),
+                    "fact_count": len(
+                        structured_facts
+                    ),
+                    "function_catalog_count": function_catalog_count,
                     "embedding_status": embedding_status,
                     "extracted_at": now,
                     "updated_at": now,
@@ -672,15 +870,54 @@ async def save_document(
     )
 
     if is_trace_extension(extension):
-        file_size = await save_text_file_to_disk_masked(
+        file_size, file_hash = await save_text_file_to_disk_masked(
             upload_file=upload_file,
             destination=destination,
         )
     else:
-        file_size = await save_file_to_disk(
+        file_size, file_hash = await save_file_to_disk(
             upload_file=upload_file,
             destination=destination,
         )
+
+    existing_document = await documents_collection.find_one(
+        duplicate_document_query(
+            conversation_id=conversation_id,
+            agent=agent,
+            extension=extension,
+            file_hash=file_hash,
+        )
+    )
+
+    if existing_document:
+        if destination.exists():
+            destination.unlink()
+
+        if (
+            extension == ".pdf"
+            and existing_document.get("fact_count") is None
+            and existing_document.get("relative_path")
+        ):
+            existing_path = BACKEND_ROOT / existing_document["relative_path"]
+
+            if existing_path.exists():
+                await extract_and_store_document(
+                    document_id=existing_document["_id"],
+                    file_path=existing_path,
+                )
+                existing_document = (
+                    await documents_collection.find_one(
+                        {
+                            "_id": existing_document["_id"],
+                        }
+                    )
+                    or existing_document
+                )
+
+        return {
+            **serialize_document(existing_document),
+            "deduplicated": True,
+        }
 
     relative_path = destination.relative_to(
         BACKEND_ROOT
@@ -697,6 +934,7 @@ async def save_document(
         "extension": extension,
         "content_type": upload_file.content_type,
         "size": file_size,
+        "file_hash": file_hash,
         "agent": agent,
         "status": "uploaded",
         "created_at": now,
@@ -739,6 +977,21 @@ async def save_document(
         )
 
         await document_sections_collection.delete_many(
+            {
+                "document_id": document_id,
+            }
+        )
+        await document_content_units_collection.delete_many(
+            {
+                "document_id": document_id,
+            }
+        )
+        await document_facts_collection.delete_many(
+            {
+                "document_id": document_id,
+            }
+        )
+        await function_catalog_collection.delete_many(
             {
                 "document_id": document_id,
             }
