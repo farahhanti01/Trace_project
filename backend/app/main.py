@@ -11,6 +11,9 @@ from app.routes.messages import router as messages_router
 from app.routes.documents import router as documents_router
 from app.routes.admin import router as admin_router
 from app.database import ensure_document_content_unit_indexes
+from app.guardrails.models import GuardrailResult, GuardrailStatus
+from app.guardrails.security.input_security_guard import InputSecurityGuardrail
+from app.guardrails.security.output_security_guard import OutputSecurityGuardrail
 from app.services.documentation_agent_service import (
     answer_documentation_question,
 )
@@ -201,17 +204,58 @@ def health():
     }
 
 
+def security_blocked_chat_response(
+    result: GuardrailResult,
+) -> StructuredResponse:
+    return StructuredResponse(
+        summary="La demande a ete bloquee par les controles de securite TRACE.",
+        sections=[
+            ResponseSection(
+                title="Controle securite",
+                content=(
+                    "La question ressemble a une tentative d'obtenir des "
+                    "instructions internes, un secret, ou une entree non "
+                    "autorisee. Aucun workflow documentaire ou log n'a ete lance."
+                ),
+            )
+        ],
+        issues=[
+            Issue(
+                severity="error",
+                title=result.code,
+                detail="Requete bloquee avant classification et avant appel LLM.",
+            )
+        ],
+        recommendations=[
+            "Reformule la question sans demander d'instructions internes ou de secrets.",
+        ],
+    )
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
+    input_security = InputSecurityGuardrail.validate(request.question)
+
+    if input_security.status == GuardrailStatus.BLOCK:
+        return ChatResponse(
+            conversation_id=request.conversation_id,
+            agent=request.agent,
+            answer=security_blocked_chat_response(input_security),
+        )
+
+    effective_question = input_security.metadata.get(
+        "redacted_text",
+        request.question,
+    )
     workflow = classify_chat_workflow(
-        question=request.question,
+        question=effective_question,
         selected_agent=request.agent,
     )
 
     if workflow == "LOG_COMPLIANCE_ANALYSIS":
         result = StructuredResponse(
             **await answer_log_question(
-                question=request.question,
+                question=effective_question,
                 conversation_id=request.conversation_id,
                 referenced_document_ids=request.referenced_document_ids,
             )
@@ -220,12 +264,17 @@ async def chat(request: ChatRequest):
     else:
         result = StructuredResponse(
             **await answer_documentation_question(
-                question=request.question,
+                question=effective_question,
                 conversation_id=request.conversation_id,
                 referenced_document_ids=request.referenced_document_ids,
                 include_all_agents=request.agent == "log",
             )
         )
+
+    secured_payload, output_security = OutputSecurityGuardrail.secure_response(
+        result.model_dump()
+    )
+    result = StructuredResponse(**secured_payload)
 
     return ChatResponse(
         conversation_id=request.conversation_id,

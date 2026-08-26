@@ -9,6 +9,8 @@ from typing import Any
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 from openai import AsyncOpenAI
 
+from app.guardrails.security.llm_message_security import secure_llm_messages
+
 
 load_dotenv()
 
@@ -85,10 +87,11 @@ async def call_hps_ai(
     presence_penalty: float = 0.3,
 ) -> str:
     client = get_ocean_client()
+    secured_messages, _security_result = secure_llm_messages(messages)
 
     request_payload = {
         "model": HPS_AI_MODEL,
-        "messages": messages,
+        "messages": secured_messages,
         "frequency_penalty": frequency_penalty,
         "presence_penalty": presence_penalty,
     }

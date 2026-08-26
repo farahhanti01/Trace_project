@@ -37,6 +37,7 @@ from app.services.retrieval_service import (
     select_relevant_sections,
 )
 from app.services.screenshot_analysis_service import answer_screenshot_question
+from app.guardrails.security.secret_guard import SecretGuardrail
 
 
 MAX_PDF_REFERENCE_SECTIONS = 4
@@ -109,6 +110,27 @@ LOG_STORY_TERMS = (
     "logstory",
     "ordre d'apparition",
     "ordre apparition",
+)
+SECURITY_AUDIT_TERMS = (
+    "api key",
+    "apikey",
+    "cle api",
+    "clé api",
+    "token",
+    "bearer",
+    "secret",
+    "client secret",
+    "client_secret",
+    "password",
+    "mot de passe",
+    "credential",
+    "identifiant sensible",
+    "donnee sensible",
+    "donnée sensible",
+)
+REDACTED_SECRET_MARKER_PATTERN = re.compile(
+    r"\b(authorization\s*:\s*bearer|api[_-]?key|client[_-]?secret|password|passwd|secret|token)\s*[:=]?\s*\[REDACTED",
+    re.IGNORECASE,
 )
 COMPLIANCE_RULE_EXTRACTION_PROMPT = """
 Tu es un extracteur de regles de conformite transactionnelle.
@@ -664,6 +686,200 @@ def display_options_for_question(
         "show_log_story": True,
         "show_hsm": False,
         "show_documentation_findings": True,
+    }
+
+
+def question_requests_security_audit(question: str) -> bool:
+    normalized = normalize_question_text(question)
+    if not normalized:
+        return False
+
+    asks_detection = any(
+        term in normalized
+        for term in (
+            "est-ce qu",
+            "est ce qu",
+            "y a-t-il",
+            "y a t il",
+            "existe",
+            "detecte",
+            "détecte",
+            "trouve",
+            "indique",
+            "affiche",
+            "extract",
+            "extraire",
+            "extrait",
+        )
+    )
+
+    return asks_detection and any(term in normalized for term in SECURITY_AUDIT_TERMS)
+
+
+def security_finding_label(code: str, context: str = "") -> str:
+    context_normalized = normalize_question_text(context)
+
+    if "authorization" in context_normalized and "bearer" in context_normalized:
+        return "Bearer token"
+    if (
+        "api_key" in context_normalized
+        or "api-key" in context_normalized
+        or "apikey" in context_normalized
+    ):
+        return "API key"
+    if "client_secret" in context_normalized or "client-secret" in context_normalized:
+        return "Client secret"
+    if (
+        "password" in context_normalized
+        or "passwd" in context_normalized
+        or "mot de passe" in context_normalized
+    ):
+        return "Password"
+    if code == "PRIVATE_KEY_DETECTED":
+        return "Private key"
+    if code == "SECRET_PLACEHOLDER_DETECTED":
+        return "Placeholder credential"
+    if code == "SECRET_DETECTED":
+        return "Credential-like secret"
+    return code.replace("_", " ").title()
+
+
+def detect_trace_security_findings(source_texts: dict[str, str]) -> list[dict[str, Any]]:
+    findings_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for source, text in source_texts.items():
+        value = str(text or "")
+        report = SecretGuardrail.inspect_text(value)
+
+        for finding in report.findings:
+            context_start = max(finding.start - 40, 0)
+            context_end = min(finding.end + 40, len(value))
+            context = value[context_start:context_end]
+            label = security_finding_label(finding.code, context)
+            key = (source, label)
+            findings_by_key.setdefault(
+                key,
+                {
+                    "source": source,
+                    "type": label,
+                    "status": (
+                        "placeholder"
+                        if finding.code == "SECRET_PLACEHOLDER_DETECTED"
+                        else "masked"
+                    ),
+                    "code": finding.code,
+                },
+            )
+
+        for match in REDACTED_SECRET_MARKER_PATTERN.finditer(value):
+            context_start = max(match.start() - 40, 0)
+            context_end = min(match.end() + 40, len(value))
+            context = value[context_start:context_end]
+            label = security_finding_label("SECRET_DETECTED", context)
+            key = (source, label)
+            findings_by_key.setdefault(
+                key,
+                {
+                    "source": source,
+                    "type": label,
+                    "status": "masked",
+                    "code": "SECRET_REDACTED_IN_TRACE",
+                },
+            )
+
+    return list(findings_by_key.values())
+
+
+def build_trace_security_audit_response(
+    *,
+    source_texts: dict[str, str],
+    display_options: dict[str, bool],
+) -> dict[str, Any]:
+    findings = detect_trace_security_findings(source_texts)
+
+    if findings:
+        detected_types = ", ".join(
+            sorted({finding["type"] for finding in findings})
+        )
+        summary = (
+            "Oui. La trace contient des donnees sensibles de type "
+            f"{detected_types}. Les valeurs completes ne sont pas affichees "
+            "car elles ont ete masquees par les guardrails de securite."
+        )
+        sections = [
+            {
+                "title": "Donnees sensibles detectees",
+                "content": (
+                    "Les elements ci-dessous ont ete identifies dans la trace. "
+                    "Les valeurs exactes restent masquees."
+                ),
+                "items": [
+                    {
+                        "label": finding["type"],
+                        "content": (
+                            f"Source: {finding['source']} - "
+                            "valeur masquee"
+                            if finding["status"] == "masked"
+                            else f"Source: {finding['source']} - placeholder"
+                        ),
+                    }
+                    for finding in findings
+                ],
+            }
+        ]
+        issues = [
+            {
+                "severity": "warning",
+                "title": "Sensitive trace data detected",
+                "detail": (
+                    "La trace contient des credentials ou tokens potentiels. "
+                    "TRACE ne les affiche pas en clair."
+                ),
+            }
+        ]
+        recommendations = [
+            "Ne partage jamais une trace contenant des secrets non masques.",
+            "Si un token reel a ete expose, considere-le comme compromis et regenere-le.",
+        ]
+    else:
+        summary = (
+            "Aucune API key, token Bearer, mot de passe, client secret ou "
+            "cle privee n'a ete detecte dans la trace chargee."
+        )
+        sections = [
+            {
+                "title": "Controle de securite",
+                "content": (
+                    "Le controle a cherche des credentials evidents dans le texte "
+                    "de trace disponible pour cette conversation."
+                ),
+                "items": [],
+            }
+        ]
+        issues = []
+        recommendations = []
+
+    return {
+        "summary": summary,
+        "sections": sections,
+        "story": [],
+        "issues": issues,
+        "recommendations": recommendations,
+        "references": [],
+        "transactions": [],
+        "statistics": {
+            "total_transactions": 0,
+            "successful_transactions": 0,
+            "failed_transactions": 0,
+            "warning_transactions": len(issues),
+        },
+        "display_options": {
+            **display_options,
+            "analysis_mode": "security",
+            "show_log_story": True,
+            "show_transactions": False,
+            "show_downloads": False,
+        },
     }
 
 
@@ -3124,6 +3340,12 @@ async def answer_log_question(
     transactions = []
 
     source_texts = log_texts or group_log_texts_by_source(log_sections)
+
+    if question_requests_security_audit(question):
+        return build_trace_security_audit_response(
+            source_texts=source_texts,
+            display_options=display_options,
+        )
 
     for source, text in source_texts.items():
         transactions.extend(

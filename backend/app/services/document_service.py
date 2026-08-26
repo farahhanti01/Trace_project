@@ -16,6 +16,10 @@ from app.database import (
     function_catalog_collection,
 )
 
+from app.guardrails.models import GuardrailStatus
+from app.guardrails.security.document_security_guard import DocumentSecurityGuardrail
+from app.guardrails.security.file_security_guard import FileSecurityGuardrail
+from app.guardrails.security.trace_security_guard import TraceSecurityGuardrail
 from app.services.extraction_service import (
     DocumentExtractionError,
     UnsupportedDocumentTypeError,
@@ -562,7 +566,18 @@ async def save_text_file_to_disk_masked(
     except UnicodeDecodeError:
         text = content.decode("latin-1")
 
-    masked_text = mask_iso_field_002(text)
+    secured_text, security_result = TraceSecurityGuardrail.secure_text(
+        text,
+        source_type="trace_upload",
+    )
+
+    if security_result.status == GuardrailStatus.BLOCK:
+        raise HTTPException(
+            status_code=400,
+            detail="Trace file rejected by security checks.",
+        )
+
+    masked_text = mask_iso_field_002(secured_text)
     encoded = masked_text.encode("utf-8")
     file_hash = sha256_hex(encoded)
 
@@ -620,6 +635,11 @@ async def extract_and_store_document(
     try:
         extraction_result = extract_document(
             file_path
+        )
+        extraction_result, document_security_result = (
+            DocumentSecurityGuardrail.secure_extraction_result(
+                extraction_result
+            )
         )
 
         # Avoid duplicate sections if extraction is retried.
@@ -826,9 +846,8 @@ async def save_document(
     conversation_id: str,
     agent: str,
 ) -> dict:
-    original_filename = Path(
-        upload_file.filename or ""
-    ).name
+    raw_filename = upload_file.filename or ""
+    original_filename = Path(raw_filename).name
 
     if not original_filename:
         raise HTTPException(
@@ -839,6 +858,18 @@ async def save_document(
     extension = Path(
         original_filename
     ).suffix.lower()
+
+    file_security = FileSecurityGuardrail.validate_upload(
+        filename=raw_filename,
+        content_type=upload_file.content_type,
+        extension=extension,
+    )
+
+    if file_security.status == GuardrailStatus.BLOCK:
+        raise HTTPException(
+            status_code=400,
+            detail=file_security.code,
+        )
 
     if not is_supported_document_extension(extension):
         raise HTTPException(
@@ -878,6 +909,23 @@ async def save_document(
         file_size, file_hash = await save_file_to_disk(
             upload_file=upload_file,
             destination=destination,
+        )
+
+    file_security = FileSecurityGuardrail.validate_upload(
+        filename=raw_filename,
+        content_type=upload_file.content_type,
+        extension=extension,
+        size=file_size,
+        max_size=MAX_FILE_SIZE,
+    )
+
+    if file_security.status == GuardrailStatus.BLOCK:
+        if destination.exists():
+            destination.unlink()
+
+        raise HTTPException(
+            status_code=400,
+            detail=file_security.code,
         )
 
     existing_document = await documents_collection.find_one(

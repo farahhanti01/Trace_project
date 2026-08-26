@@ -8,6 +8,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.guardrails.models import GuardrailResult, GuardrailStatus
+from app.guardrails.output_guard import OutputGuardrail
+from app.guardrails.retrieval_guard import RetrievalEvidenceGuardrail
 from app.models.document_content import (
     ContentUnit,
     EvidenceBundle,
@@ -1345,15 +1348,25 @@ async def build_evidence_candidate(
     supported = evidence_pipeline_allowed(classification.intent)
     fallback_reason = None
     response = None
+    blocked_response = None
     error = None
     validation = EvidenceValidationResult(valid=False)
+    output_guardrail = GuardrailResult.pass_(
+        code="OUTPUT_NOT_EVALUATED",
+        reason="No response was produced yet.",
+    )
+    retrieval_guardrail = RetrievalEvidenceGuardrail.validate(
+        question=effective_question,
+        intent=classification.intent,
+        bundle=bundle,
+        retrieval_complete=retrieval.completeness.retrieval_complete,
+        query_plan=query_plan,
+    )
 
     if not supported:
         fallback_reason = "UNSUPPORTED_INTENT"
-    elif not retrieval.completeness.retrieval_complete:
-        fallback_reason = "INCOMPLETE_RETRIEVAL"
-    elif not bundle_has_evidence(bundle):
-        fallback_reason = "INSUFFICIENT_EVIDENCE"
+    elif not retrieval_guardrail.passed:
+        fallback_reason = retrieval_guardrail.code
     else:
         writer_started = time.perf_counter()
 
@@ -1420,16 +1433,29 @@ async def build_evidence_candidate(
             else:
                 fallback_reason = "UNSUPPORTED_CLAIM"
 
+        output_guardrail = OutputGuardrail.validate(
+            response=response,
+            documentary_evidence_used=bundle_has_evidence(bundle),
+            known_document_ids=set(document_ids),
+            evidence_bundle=bundle,
+        )
+
+        if output_guardrail.status == GuardrailStatus.BLOCK:
+            if not fallback_reason:
+                fallback_reason = output_guardrail.code
+            blocked_response = response
+            response = None
+
     latency.total_evidence_ms = round(
         (time.perf_counter() - total_started) * 1000
     )
 
     candidate_valid = bool(
         supported
-        and retrieval.completeness.retrieval_complete
-        and bundle_has_evidence(bundle)
+        and retrieval_guardrail.passed
         and response
         and validation.valid
+        and output_guardrail.status != GuardrailStatus.BLOCK
         and not error
     )
 
@@ -1444,7 +1470,12 @@ async def build_evidence_candidate(
         "evidence_bundle": bundle,
         "supported": supported,
         "response": response,
+        "blocked_response": blocked_response,
         "validation": validation,
+        "guardrails": {
+            "retrieval": retrieval_guardrail.model_dump(),
+            "output": output_guardrail.model_dump(),
+        },
         "latency": latency,
         "diagnostics": evidence_candidate_diagnostics(
             retrieval=retrieval,
@@ -1576,6 +1607,7 @@ async def shadow_evidence_response(
             ),
             "response": candidate["response"],
             "validation": candidate["validation"].model_dump(),
+            "guardrails": candidate["guardrails"],
             "diagnostics": candidate["diagnostics"],
             "error": candidate["error"],
             "fallback_reason": candidate["fallback_reason"],
@@ -1595,6 +1627,7 @@ async def shadow_evidence_response(
             "missing_evidence": [str(error)],
             "response": None,
             "validation": EvidenceValidationResult(valid=False).model_dump(),
+            "guardrails": None,
             "error": str(error),
             "fallback_reason": "WRITER_ERROR",
             "latency_ms": 0,
