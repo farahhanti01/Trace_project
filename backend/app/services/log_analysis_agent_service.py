@@ -89,6 +89,11 @@ TOTAL_ANALYSIS_TERMS = (
     "analyse totale",
     "analyse complete",
     "analyse globale",
+    "analyse de trace",
+    "analyse d'une trace",
+    "analyse d un trace",
+    "analyse du trace",
+    "analyse des traces",
     "tout analyser",
     "toute la trace",
     "all analysis",
@@ -616,15 +621,15 @@ def display_options_for_question(
     question: str,
 ) -> dict[str, bool]:
     normalized = normalize_question_text(question)
-    wants_generic_trace_analysis = any(
-        term in normalized
-        for term in (
-            "analyse cette trace",
-            "analyse la trace",
-            "analyse ce log",
-            "analyse le log",
-            "analyze this trace",
-            "analyze the trace",
+    wants_generic_trace_analysis = bool(
+        re.search(r"\banalys(?:e|er)\b.*\b(?:trace|log)\b", normalized)
+        or re.search(r"\b(?:trace|log)\b.*\banalyse\b", normalized)
+        or any(
+            term in normalized
+            for term in (
+                "analyze this trace",
+                "analyze the trace",
+            )
         )
     )
     wants_total = (
@@ -644,6 +649,15 @@ def display_options_for_question(
         and re.search(r"\b(?:uniquement|seulement|only)\b", normalized)
     )
 
+    if only_hsm:
+        return {
+            "analysis_mode": "hsm",
+            "show_fields": False,
+            "show_log_story": False,
+            "show_hsm": True,
+            "show_documentation_findings": True,
+        }
+
     if wants_total:
         return {
             "analysis_mode": "total",
@@ -654,15 +668,6 @@ def display_options_for_question(
         }
 
     if wants_hsm:
-        return {
-            "analysis_mode": "hsm",
-            "show_fields": False,
-            "show_log_story": False,
-            "show_hsm": True,
-            "show_documentation_findings": True,
-        }
-
-    if only_hsm:
         return {
             "analysis_mode": "hsm",
             "show_fields": False,
@@ -714,6 +719,137 @@ def question_requests_security_audit(question: str) -> bool:
     )
 
     return asks_detection and any(term in normalized for term in SECURITY_AUDIT_TERMS)
+
+
+def requested_extraction_fields(question: str) -> list[str]:
+    normalized = normalize_question_text(question)
+    asks_extraction = any(
+        term in normalized
+        for term in (
+            "trouve",
+            "trouves",
+            "trouvees",
+            "trouvés",
+            "extrait",
+            "extrais",
+            "extraire",
+            "extract",
+            "liste",
+            "affiche",
+            "donne",
+            "quels sont",
+            "quelles sont",
+        )
+    )
+    if not asks_extraction:
+        return []
+
+    fields = {
+        match.group(1).zfill(3)
+        for match in re.finditer(
+            r"\b(?:field|fields|champ|champs|fld)\s*0?([0-9]{2,3})\b",
+            normalized,
+        )
+    }
+
+    return sorted(fields)
+
+
+def build_field_extraction_response(
+    *,
+    transactions: list[dict[str, Any]],
+    fields: list[str],
+    display_options: dict[str, bool],
+) -> dict[str, Any]:
+    rows = []
+
+    for field in fields:
+        for transaction in transactions:
+            value = (transaction.get("fields") or {}).get(field)
+            if value in {None, ""}:
+                continue
+            rows.append(
+                {
+                    "field": field,
+                    "value": value,
+                    "mti": transaction.get("mti") or "N/A",
+                    "rrn": (transaction.get("fields") or {}).get("037") or "N/A",
+                    "transaction": transaction.get("display_name")
+                    or transaction.get("transaction_id")
+                    or "Transaction",
+                    "source": transaction.get("source") or "trace",
+                }
+            )
+
+    if rows:
+        field_label = ", ".join(f"Field {field}" for field in fields)
+        summary = (
+            f"{len(rows)} valeur(s) observee(s) pour {field_label} dans la trace."
+        )
+        sections = [
+            {
+                "title": "Valeurs extraites de la trace",
+                "content": (
+                    "Ces valeurs proviennent directement des champs ISO visibles "
+                    "dans la trace analysee. Aucune definition documentaire n'a "
+                    "ete utilisee pour cette extraction."
+                ),
+                "blocks": [
+                    {
+                        "type": "table",
+                        "columns": [
+                            {"key": "field", "label": "Field"},
+                            {"key": "value", "label": "Valeur"},
+                            {"key": "mti", "label": "MTI"},
+                            {"key": "rrn", "label": "RRN"},
+                            {"key": "source", "label": "Source"},
+                        ],
+                        "rows": rows,
+                    }
+                ],
+            }
+        ]
+        issues = []
+    else:
+        field_label = ", ".join(f"Field {field}" for field in fields)
+        summary = (
+            f"Aucune valeur n'a ete trouvee pour {field_label} dans la trace analysee."
+        )
+        sections = [
+            {
+                "title": "Extraction de champ",
+                "content": (
+                    "Le champ demande n'apparait pas dans les transactions parsees "
+                    "de la trace courante."
+                ),
+                "items": [],
+            }
+        ]
+        issues = [
+            {
+                "severity": "warning",
+                "title": "Field not found in trace",
+                "detail": "Le champ demande n'a pas ete extrait depuis la trace.",
+            }
+        ]
+
+    return {
+        "summary": summary,
+        "sections": sections,
+        "story": [],
+        "issues": issues,
+        "recommendations": [],
+        "references": [],
+        "transactions": [],
+        "statistics": build_statistics(visible_response_transactions(transactions)),
+        "display_options": {
+            **display_options,
+            "analysis_mode": "field_extraction",
+            "show_log_story": False,
+            "show_transactions": False,
+            "show_downloads": False,
+        },
+    }
 
 
 def security_finding_label(code: str, context: str = "") -> str:
@@ -1748,7 +1884,7 @@ def clean_field_value_for_length_check(
     if not text or text.upper() == "N/A" or "*" in text:
         return None
 
-    return re.sub(r"\s+", "", text)
+    return text
 
 
 def build_pdf_length_documentation_findings(
@@ -1757,6 +1893,7 @@ def build_pdf_length_documentation_findings(
 ) -> list[dict[str, Any]]:
     findings = []
     fields = transaction.get("fields") or {}
+    field_lengths = transaction.get("field_lengths") or {}
 
     for field, raw_value in fields.items():
         normalized_field = normalize_field_number(field)
@@ -1770,7 +1907,12 @@ def build_pdf_length_documentation_findings(
         if observed_value is None:
             continue
 
-        observed_length = len(observed_value)
+        declared_length = field_lengths.get(normalized_field)
+        observed_length = (
+            declared_length
+            if isinstance(declared_length, int) and declared_length > 0
+            else len(observed_value)
+        )
         expected_length = rule["expected"]
 
         if observed_length == expected_length:
@@ -3353,6 +3495,14 @@ async def answer_log_question(
                 text=text,
                 source=source,
             )
+        )
+
+    extraction_fields = requested_extraction_fields(question)
+    if extraction_fields:
+        return build_field_extraction_response(
+            transactions=transactions,
+            fields=extraction_fields,
+            display_options=display_options,
         )
 
     await enrich_transactions_with_documentation(

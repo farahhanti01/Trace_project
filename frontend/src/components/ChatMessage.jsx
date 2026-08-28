@@ -230,7 +230,7 @@ export default function ChatMessage({
           <div className="chat-message__assistant-followup">
             <div className="chat-message__assistant-toolbar">
               <div className="chat-message__assistant-tools">
-                <button
+                {/* <button
                   type="button"
                   className="chat-message__assistant-tool"
                   onClick={handleCopyResponse}
@@ -241,18 +241,18 @@ export default function ChatMessage({
                     <Copy className="chat-message__assistant-tool-icon" />
                   )}
                   <span>{copied ? "Copié" : "Copier"}</span>
-                </button>
+                </button> */}
 
-                <button
+                {/* <button
                   type="button"
                   className="chat-message__assistant-tool"
                   onClick={handleExportJson}
-                >
-                  <Download className="chat-message__assistant-tool-icon" />
+                > */}
+                  {/* <Download className="chat-message__assistant-tool-icon" />
                   <span>Exporter JSON</span>
-                </button>
+                </button> */}
 
-                {onRetry && (
+                {/* {onRetry && (
                   <button
                     type="button"
                     className="chat-message__assistant-tool"
@@ -261,11 +261,11 @@ export default function ChatMessage({
                     <RotateCcw className="chat-message__assistant-tool-icon" />
                     <span>Relancer</span>
                   </button>
-                )}
+                )} */}
               </div>
 
               <div className="chat-message__assistant-feedback">
-                <button
+                {/* <button
                   type="button"
                   className={`chat-message__feedback-button${feedback === "up" ? " chat-message__feedback-button--active" : ""}`}
                   onClick={() => setFeedback((value) => value === "up" ? null : "up")}
@@ -273,9 +273,9 @@ export default function ChatMessage({
                   title="Réponse utile"
                 >
                   <ThumbsUp className="chat-message__assistant-tool-icon" />
-                </button>
+                </button> */}
 
-                <button
+                {/* <button
                   type="button"
                   className={`chat-message__feedback-button${feedback === "down" ? " chat-message__feedback-button--active" : ""}`}
                   onClick={() => setFeedback((value) => value === "down" ? null : "down")}
@@ -283,7 +283,7 @@ export default function ChatMessage({
                   title="Réponse à améliorer"
                 >
                   <ThumbsDown className="chat-message__assistant-tool-icon" />
-                </button>
+                </button> */}
               </div>
             </div>
 

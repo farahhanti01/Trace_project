@@ -13,7 +13,7 @@ MTI_PATTERN = re.compile(
 )
 FIELD_PATTERN = re.compile(
     r"\bFLD\s*\(\s*0*(?P<field>\d{1,3}(?:\.\d+)?)\s*\)"
-    r"\s*:?\s*\([^)]*\)\s*:?\s*\[(?P<value>[^\]]*)\]",
+    r"\s*:?\s*\(\s*(?P<length>\d{1,4})?[^)]*\)\s*:?\s*\[(?P<value>[^\]]*)\]",
     flags=re.IGNORECASE,
 )
 TLV_FIELD_PATTERN = re.compile(
@@ -299,7 +299,12 @@ def split_hsm_transactions(
 
 def parse_transaction_fields(
     lines: list[tuple[int, str]],
-) -> tuple[str | None, dict[str, str | None], list[dict[str, Any]]]:
+) -> tuple[
+    str | None,
+    dict[str, str | None],
+    dict[str, int],
+    list[dict[str, Any]],
+]:
     mti = None
     fields: dict[str, str | None] = {
         "002": None,
@@ -307,6 +312,7 @@ def parse_transaction_fields(
         "037": None,
         "039": None,
     }
+    field_lengths: dict[str, int] = {}
     evidence = []
 
     for line_number, line in lines:
@@ -327,6 +333,10 @@ def parse_transaction_fields(
         if field_match:
             field = normalize_field_id(field_match.group("field"))
             value = field_match.group("value")
+            length = field_match.group("length")
+
+            if length and length.isdigit():
+                field_lengths[field] = int(length)
         else:
             tlv_field = extract_tlv_field_value(line)
 
@@ -350,7 +360,7 @@ def parse_transaction_fields(
             "type": f"field_{field}",
         })
 
-    return mti, fields, evidence
+    return mti, fields, field_lengths, evidence
 
 
 def status_from_end_args(
@@ -1248,7 +1258,7 @@ def parse_log_transactions(
     parsed_transactions = []
 
     for index, chunk in enumerate(chunks, start=1):
-        mti, fields, field_evidence = parse_transaction_fields(
+        mti, fields, field_lengths, field_evidence = parse_transaction_fields(
             chunk["lines"]
         )
         log_story = parse_log_story(chunk["lines"])
@@ -1272,6 +1282,7 @@ def parse_log_transactions(
             "end_line": chunk["end_line"],
             "mti": mti,
             "fields": fields,
+            "field_lengths": field_lengths,
             "status": transaction_status(fields, log_story),
             "log_story": log_story,
             "hsm_analysis": hsm_analysis,

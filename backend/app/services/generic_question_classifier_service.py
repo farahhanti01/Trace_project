@@ -103,6 +103,52 @@ def unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
 
 
+def extract_explicit_requested_codes(
+    question: str,
+    *,
+    field_numbers: list[str],
+) -> list[str]:
+    """Extract codes listed by the user for a known field.
+
+    This intentionally does not treat every number in a question as a code.
+    It only activates when a field is already explicit and the wording asks
+    for codes, values or meanings.
+    """
+    if not field_numbers:
+        return []
+
+    normalized = normalize_for_search(question)
+
+    if not re.search(
+        r"\b(codes?|valeurs?|values?|significations?|meanings?)\b",
+        normalized,
+    ):
+        return []
+
+    field_aliases = set(field_numbers)
+    field_aliases.update(
+        value.lstrip("0") or value
+        for value in field_numbers
+    )
+    codes = []
+
+    for token in re.findall(r"\b[A-Za-z0-9]{2,4}\b", question):
+        code = token.upper()
+
+        if code in field_aliases:
+            continue
+
+        if code in {"AN", "PDF", "MTI", "ISO", "HSM"}:
+            continue
+
+        if not re.search(r"\d", code):
+            continue
+
+        codes.append(code)
+
+    return unique(codes)
+
+
 def extract_terms(question: str) -> list[str]:
     terms = re.findall(r"[a-zA-Z0-9_.-]{3,}", normalize_for_search(question))
 
@@ -132,6 +178,13 @@ def extract_generic_entities(question: str) -> GenericEntities:
     ):
         field_numbers.append(normalize_field_number(match.group(1)))
         codes.append(match.group(2).upper())
+
+    codes.extend(
+        extract_explicit_requested_codes(
+            question,
+            field_numbers=unique(field_numbers),
+        )
+    )
 
     message_types = re.findall(
         r"\b(?:0[1248]00|0[1248]10|1[1248]10|0100|0110|0200|0210)\b",

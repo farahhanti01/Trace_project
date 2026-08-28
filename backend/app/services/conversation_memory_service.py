@@ -22,7 +22,9 @@ from app.services.generic_question_classifier_service import (
     normalize_for_search,
 )
 
-
+# conversation_id
+# active_topic
+# active_entity
 logger = logging.getLogger(__name__)
 
 MAX_RECENT_MESSAGES = int(os.getenv("DOCUMENTATION_MEMORY_RECENT_MESSAGES", "10"))
@@ -93,6 +95,43 @@ COMMON_NON_FUNCTION_TOKENS = {
 }
 
 
+def extract_requested_code_tokens(question: str, field_numbers: list[str] | None = None) -> list[str]:
+    normalized = normalize_for_search(question)
+
+    if not re.search(
+        r"\b(codes?|valeurs?|values?|significations?|meanings?)\b",
+        normalized,
+    ):
+        return []
+
+    field_aliases = set(field_numbers or [])
+    field_aliases.update(
+        value.lstrip("0") or value
+        for value in field_numbers or []
+    )
+    ignored_tokens = {
+        "AN",
+        "PDF",
+        "MTI",
+        "ISO",
+        "HSM",
+    }
+    codes = []
+
+    for token in re.findall(r"\b[A-Za-z0-9]{2,4}\b", question):
+        code = token.upper()
+
+        if code in ignored_tokens or code in field_aliases:
+            continue
+
+        if not re.search(r"\d", code):
+            continue
+
+        codes.append(code)
+
+    return unique(codes)
+
+
 def looks_like_function_name(value: str) -> bool:
     name = str(value or "").strip().strip("()")
 
@@ -146,6 +185,7 @@ def extract_current_entities(question: str) -> dict[str, Any]:
         explicit["field_number"] = entities.field_numbers[0]
 
     if entities.codes:
+        explicit["codes"] = entities.codes
         explicit["code"] = entities.codes[0]
 
     if entities.message_types:
@@ -178,6 +218,19 @@ def extract_current_entities(question: str) -> dict[str, Any]:
 
         if bare_code and "field_number" not in explicit:
             explicit["code"] = bare_code.group(1).upper()
+            explicit["codes"] = [explicit["code"]]
+
+    if "codes" not in explicit:
+        requested_codes = extract_requested_code_tokens(
+            question,
+            field_numbers=entities.field_numbers,
+        )
+
+        if requested_codes:
+            explicit["codes"] = requested_codes
+
+            if len(requested_codes) == 1 and "code" not in explicit:
+                explicit["code"] = requested_codes[0]
 
     if re.search(r"\breversal|reversals|annulation|annulations\b", normalized):
         explicit["concept"] = "reversal"
@@ -919,6 +972,18 @@ class ConversationContextResolver:
                 inherited["field_number"] = active_entities["field_number"]
                 used_memory = True
 
+        if (
+            "field_number" not in explicit
+            and "codes" in explicit
+            and "field_number" not in inherited
+        ):
+            if field_history_is_ambiguous(state):
+                ambiguity = True
+                ambiguity_reason = "multiple_recent_fields_without_active_field"
+            elif active_entities.get("field_number"):
+                inherited["field_number"] = active_entities["field_number"]
+                used_memory = True
+
         if object_reference_followup and not has_explicit_context:
             object_entities = entities_from_active_object(state.active_object)
 
@@ -1031,6 +1096,11 @@ class ConversationContextResolver:
         function_name = entities.get("function_name")
         function_topic = entities.get("function_topic")
         code = entities.get("code")
+        codes = [
+            str(value).upper()
+            for value in entities.get("codes", []) or []
+            if value
+        ]
         concept = entities.get("concept")
         compare_field = entities.get("compare_field_number")
         message_type = entities.get("message_type")
@@ -1055,6 +1125,20 @@ class ConversationContextResolver:
 
         if compare_field and field_number:
             return f"Compare le Field {field_number} avec le Field {compare_field}."
+
+        if field_number and len(codes) > 1:
+            codes_text = ", ".join(codes)
+
+            if re.search(r"\b(compare|comparer|comparaison)\b", normalized):
+                return (
+                    f"Compare les codes {codes_text} du Field {field_number} "
+                    "avec leurs significations documentaires."
+                )
+
+            return (
+                f"{original_query} Cible documentaire: Field {field_number}. "
+                f"Codes demandes: {codes_text}."
+            )
 
         if field_number and code:
             return f"Que signifie Field {field_number} = {code} ?"

@@ -35,6 +35,7 @@ from app.services.documentation_evidence_generation_service import (
     evidence_table_lookup_generation_enabled,
     shadow_evidence_response,
     try_generate_evidence_response,
+    try_generate_requested_codes_response,
     try_generate_table_lookup_response,
 )
 from app.services.conversation_memory_service import (
@@ -73,6 +74,31 @@ DOCUMENT_DISPLAY_NAMES = {
         "BASE I Technical Specifications, Volume 1"
     ),
 }
+
+
+def merge_document_context_ids(
+    referenced_document_ids: list[str] | None,
+    memory_state: Any | None,
+) -> list[str]:
+    """Combine current document references with the conversation document context."""
+    active_document_ids = getattr(memory_state, "active_document_ids", None) or []
+    merged: list[str] = []
+
+    for document_id in [
+        *(referenced_document_ids or []),
+        *active_document_ids,
+    ]:
+        if not document_id:
+            continue
+
+        value = str(document_id)
+
+        if value not in merged:
+            merged.append(value)
+
+    return merged
+
+
 DOCUMENTATION_RESPONSE_SCHEMA = (
     '{"summary": string, "sections": [{"title": string, "content": string, '
     '"source_ids": string[]}], "issues": [{"severity": "info|warning|error", '
@@ -2846,6 +2872,11 @@ async def answer_documentation_question(
     except Exception as error:
         logger.info("MEMORY_RESOLUTION_ERROR %s", error)
 
+    effective_referenced_document_ids = merge_document_context_ids(
+        referenced_document_ids,
+        memory_state,
+    )
+
     if (
         memory_resolution
         and memory_resolution.query_type == "CONVERSATION_RECALL"
@@ -2855,7 +2886,7 @@ async def answer_documentation_question(
                 conversation_id=conversation_id,
                 state=memory_state,
                 resolved=memory_resolution,
-                referenced_document_ids=referenced_document_ids,
+                referenced_document_ids=effective_referenced_document_ids,
             )
             return {
                 "summary": memory_resolution.recall_answer,
@@ -2889,7 +2920,7 @@ async def answer_documentation_question(
     screenshot_response = await answer_screenshot_question(
         question=effective_question,
         conversation_id=conversation_id,
-        referenced_document_ids=referenced_document_ids,
+        referenced_document_ids=effective_referenced_document_ids,
         agent="documentation",
     )
 
@@ -2898,7 +2929,7 @@ async def answer_documentation_question(
             conversation_id=conversation_id,
             state=memory_state,
             resolved=memory_resolution,
-            referenced_document_ids=referenced_document_ids,
+            referenced_document_ids=effective_referenced_document_ids,
         )
         return screenshot_response
 
@@ -2907,7 +2938,7 @@ async def answer_documentation_question(
             question=effective_question,
             original_question=question,
             conversation_id=conversation_id,
-            referenced_document_ids=referenced_document_ids,
+            referenced_document_ids=effective_referenced_document_ids,
             memory_resolution=memory_resolution,
         )
 
@@ -2916,7 +2947,7 @@ async def answer_documentation_question(
                 conversation_id=conversation_id,
                 state=memory_state,
                 resolved=memory_resolution,
-                referenced_document_ids=referenced_document_ids,
+                referenced_document_ids=effective_referenced_document_ids,
             )
             return function_response
     except Exception as error:
@@ -2924,7 +2955,7 @@ async def answer_documentation_question(
 
     sections = await load_sections(
         conversation_id,
-        referenced_document_ids=referenced_document_ids,
+        referenced_document_ids=effective_referenced_document_ids,
         include_all_agents=include_all_agents,
     )
 
@@ -2958,6 +2989,27 @@ async def answer_documentation_question(
         and not force_legacy
     ):
         try:
+            requested_codes_response = await try_generate_requested_codes_response(
+                question=effective_question,
+                sections=sections,
+                original_question=question,
+                conversation_id=conversation_id,
+                memory_resolution=memory_resolution,
+            )
+            await update_documentation_memory(
+                conversation_id=conversation_id,
+                state=memory_state,
+                resolved=memory_resolution,
+                referenced_document_ids=effective_referenced_document_ids,
+            )
+            return requested_codes_response
+        except Exception as error:
+            logger.info(
+                "EVIDENCE_REQUESTED_CODES_FALLBACK reason=%s",
+                error,
+            )
+
+        try:
             table_response = await try_generate_table_lookup_response(
                 question=effective_question,
                 sections=sections,
@@ -2969,7 +3021,7 @@ async def answer_documentation_question(
                 conversation_id=conversation_id,
                 state=memory_state,
                 resolved=memory_resolution,
-                referenced_document_ids=referenced_document_ids,
+                referenced_document_ids=effective_referenced_document_ids,
             )
             return table_response
         except Exception as error:
@@ -2991,7 +3043,7 @@ async def answer_documentation_question(
                 conversation_id=conversation_id,
                 state=memory_state,
                 resolved=memory_resolution,
-                referenced_document_ids=referenced_document_ids,
+                referenced_document_ids=effective_referenced_document_ids,
             )
             return evidence_response
         except Exception as error:
@@ -3088,7 +3140,7 @@ async def answer_documentation_question(
         conversation_id=conversation_id,
         state=memory_state,
         resolved=memory_resolution,
-        referenced_document_ids=referenced_document_ids,
+        referenced_document_ids=effective_referenced_document_ids,
     )
 
     if evidence_shadow_enabled() and not force_legacy:

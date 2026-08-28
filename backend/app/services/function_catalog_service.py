@@ -39,6 +39,28 @@ STATUS_BLOCK_HEADER_PATTERN = re.compile(
     r"^\s*(?P<label>[A-Za-z][A-Za-z _/-]*?)\s*\(\s*(?P<code>-?\d+)\s*\)\s*:?\s*$",
     flags=re.I,
 )
+INLINE_STATUS_BLOCK_PATTERN = re.compile(
+    r"^\s*(?P<label>[A-Za-z][A-Za-z _/-]*?)"
+    r"(?:\s*\(\s*(?P<code>-?\d+)\s*\))?\s*:\s*(?P<detail>.+)$",
+    flags=re.I,
+)
+KNOWN_STATUS_HEADER_PATTERN = re.compile(
+    r"^\s*(?P<label>OK|SUCCESS|NOK|ERROR|ERR|KO|FAILED|FAILURE|EXCEPTION)"
+    r"\s*(?:\(\s*(?P<code>-?\d+)\s*\))?\s*:?\s*$",
+    flags=re.I,
+)
+KNOWN_STATUS_LABELS = {
+    "OK",
+    "SUCCESS",
+    "NOK",
+    "ERROR",
+    "ERR",
+    "KO",
+    "FAILED",
+    "FAILURE",
+    "EXCEPTION",
+    "SYSTEM_MALFUNCTION",
+}
 EXAMPLE_PATTERN = re.compile(
     r"\b(exemple|example|start\s+[A-Za-z_][A-Za-z0-9_]+|end\s+[A-Za-z_][A-Za-z0-9_]+|scenario|cas\s+concret)\b",
     flags=re.I,
@@ -114,6 +136,57 @@ def clean_status_detail(value: Any) -> str:
     return text
 
 
+def match_status_header(value: Any) -> re.Match[str] | None:
+    text = clean_observation(value)
+    return (
+        STATUS_BLOCK_HEADER_PATTERN.match(text)
+        or KNOWN_STATUS_HEADER_PATTERN.match(text)
+    )
+
+
+def status_block_title(label: str, code: str | None) -> str:
+    normalized_label = clean_observation(label).upper()
+
+    if code is None:
+        return normalized_label
+
+    return f"{normalized_label} ({code})"
+
+
+def is_exception_status(label: str, code: str | None) -> bool:
+    normalized_label = clean_observation(label).upper()
+
+    if normalized_label in {"OK", "SUCCESS"}:
+        return False
+
+    return code != "0"
+
+
+def split_structured_line(text: str) -> list[str]:
+    if "|" not in text:
+        return [text]
+
+    return [
+        part.strip()
+        for part in text.split("|")
+        if part.strip()
+    ]
+
+
+def inline_status_match(value: Any) -> re.Match[str] | None:
+    match = INLINE_STATUS_BLOCK_PATTERN.match(clean_observation(value))
+
+    if not match:
+        return None
+
+    label = clean_observation(match.group("label")).upper()
+
+    if label not in KNOWN_STATUS_LABELS:
+        return None
+
+    return match
+
+
 def looks_like_function_name(value: str) -> bool:
     name = str(value or "").strip().strip("()")
 
@@ -184,6 +257,9 @@ def extract_error_cases(text: str) -> list[str]:
             observations.append(format_status_block(block))
 
     for part in split_observations(text):
+        if match_status_header(part):
+            continue
+
         if ERROR_CASE_PATTERN.search(part):
             observations.append(part)
 
@@ -197,54 +273,50 @@ def extract_status_blocks(text: str) -> list[dict[str, Any]]:
     current: dict[str, Any] | None = None
 
     for raw_line in str(text or "").splitlines():
-        line = raw_line.strip()
+        for line in split_structured_line(raw_line.strip()):
+            if not line:
+                continue
 
-        if not line:
-            continue
+            header_match = match_status_header(line)
 
-        header_match = STATUS_BLOCK_HEADER_PATTERN.match(line)
-        trailing_details: list[str] = []
+            if header_match:
+                if current:
+                    blocks.append(current)
 
-        if not header_match and "|" in line:
-            parts = [
-                part.strip()
-                for part in line.split("|")
-                if part.strip()
-            ]
+                label = clean_observation(header_match.group("label")).upper()
+                code = header_match.group("code")
+                current = {
+                    "label": label,
+                    "code": code,
+                    "title": status_block_title(label, code),
+                    "details": [],
+                    "is_exception": is_exception_status(label, code),
+                }
+                continue
 
-            for index, part in enumerate(parts):
-                possible_header = STATUS_BLOCK_HEADER_PATTERN.match(part)
+            inline_match = inline_status_match(line)
 
-                if possible_header:
-                    header_match = possible_header
-                    trailing_details = parts[index + 1:]
-                    break
+            if inline_match:
+                if current:
+                    blocks.append(current)
 
-        if header_match:
+                label = clean_observation(inline_match.group("label")).upper()
+                code = inline_match.group("code")
+                detail = clean_status_detail(inline_match.group("detail"))
+                current = {
+                    "label": label,
+                    "code": code,
+                    "title": status_block_title(label, code),
+                    "details": [detail] if detail else [],
+                    "is_exception": is_exception_status(label, code),
+                }
+                continue
+
             if current:
-                blocks.append(current)
-
-            label = clean_observation(header_match.group("label")).upper()
-            code = header_match.group("code")
-            current = {
-                "label": label,
-                "code": code,
-                "title": f"{label} ({code})",
-                "details": [],
-                "is_exception": label not in {"OK", "SUCCESS"} and code != "0",
-            }
-            for trailing_detail in trailing_details:
-                detail = clean_status_detail(trailing_detail)
+                detail = clean_status_detail(line)
 
                 if detail:
                     current["details"].append(detail)
-            continue
-
-        if current:
-            detail = clean_status_detail(line)
-
-            if detail:
-                current["details"].append(detail)
 
     if current:
         blocks.append(current)
@@ -316,6 +388,149 @@ def deduplicate_references(references: list[dict[str, Any]]) -> list[dict[str, A
         unique_references.append(reference)
 
     return unique_references
+
+
+def ordered_cell_values(entry: dict[str, Any]) -> list[str]:
+    cells = entry.get("cells") or []
+
+    if not isinstance(cells, list):
+        return []
+
+    ordered_cells = sorted(
+        [
+            cell
+            for cell in cells
+            if isinstance(cell, dict) and cell.get("value") is not None
+        ],
+        key=lambda cell: int(cell.get("column") or 0),
+    )
+
+    return [
+        clean_observation(cell.get("value"))
+        for cell in ordered_cells
+        if clean_observation(cell.get("value"))
+    ]
+
+
+def looks_like_source_path(value: str) -> bool:
+    text = str(value or "").strip()
+
+    return bool(
+        re.search(r"[\\/]", text)
+        or re.search(r"\.(?:c|pc|h|java|py|sql|pkg|pks|pkb)$", text, flags=re.I)
+    )
+
+
+def looks_like_library_name(value: str) -> bool:
+    text = str(value or "").strip()
+
+    return bool(re.match(r"^lib[A-Za-z0-9_-]+$", text))
+
+
+def strip_status_suffix(value: str) -> str:
+    text = clean_observation(value)
+    chunks = split_structured_line(text)
+    kept = []
+
+    for chunk in chunks:
+        if match_status_header(chunk) or inline_status_match(chunk):
+            break
+
+        kept.append(chunk)
+
+    cleaned = " | ".join(kept).strip()
+    cleaned = re.split(
+        r"\s+(?:NOK|OK|SUCCESS|ERROR|ERR|KO|FAILED|FAILURE|EXCEPTION|SYSTEM_MALFUNCTION)"
+        r"\s*(?:\(-?\d+\))?\s*:",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" |")
+
+    return cleaned
+
+
+def function_overview(entry: dict[str, Any], function_name: str) -> dict[str, Any]:
+    values = ordered_cell_values(entry)
+    metadata: dict[str, str] = {}
+    description_candidates: list[str] = []
+    normalized_function_name = normalize_identifier(function_name)
+
+    for index, value in enumerate(values):
+        if not value:
+            continue
+
+        if index == 0 and normalize_identifier(value) == normalized_function_name:
+            continue
+
+        if looks_like_library_name(value) and "library" not in metadata:
+            metadata["library"] = value
+            continue
+
+        if looks_like_source_path(value) and "source_path" not in metadata:
+            metadata["source_path"] = value
+            continue
+
+        if match_status_header(value) or inline_status_match(value):
+            continue
+
+        description_candidates.append(value)
+
+    if not description_candidates and entry.get("description"):
+        raw_parts = split_structured_line(str(entry.get("description") or ""))
+        description_candidates = [
+            part
+            for part in raw_parts
+            if normalize_identifier(part) != normalized_function_name
+            and not looks_like_library_name(part)
+            and not looks_like_source_path(part)
+            and not match_status_header(part)
+            and not inline_status_match(part)
+        ]
+
+    description = ""
+
+    for candidate in description_candidates:
+        cleaned = strip_status_suffix(candidate)
+
+        if cleaned and len(cleaned) > len(description):
+            description = cleaned
+
+    return {
+        "description": description or (
+            f"La fonction {function_name} est presente dans la documentation."
+        ),
+        "metadata": metadata,
+    }
+
+
+def merged_function_overview(
+    entries: list[dict[str, Any]],
+    function_name: str,
+) -> dict[str, Any]:
+    overviews = [
+        function_overview(entry, function_name)
+        for entry in entries
+    ]
+    description = next(
+        (
+            overview["description"]
+            for overview in overviews
+            if overview.get("description")
+            and "est presente dans la documentation" not in overview["description"]
+        ),
+        f"La fonction {function_name} est presente dans la documentation.",
+    )
+    metadata: dict[str, str] = {}
+
+    for overview in overviews:
+        for key, value in (overview.get("metadata") or {}).items():
+            metadata.setdefault(key, value)
+
+    return {
+        "description": description,
+        "metadata": metadata,
+    }
 
 
 class FunctionCatalogExtractor:
@@ -699,6 +914,38 @@ def section_from_status_blocks(
     }
 
 
+def status_blocks_section_for_function(
+    *,
+    function_name: str,
+    blocks: list[dict[str, Any]],
+    source_ids: list[str],
+    title: str = "Codes retour / comportements documentes",
+) -> dict[str, Any] | None:
+    if not blocks:
+        return None
+
+    return section_from_status_blocks(
+        title=title,
+        intro=(
+            f"Voici les statuts et comportements documentes pour la fonction "
+            f"{function_name}. Les libelles sont conserves depuis la source."
+        ),
+        blocks=blocks,
+        source_ids=source_ids,
+    )
+
+
+def has_exception_status_block(blocks: list[dict[str, Any]]) -> bool:
+    return any(
+        block.get("is_exception")
+        and (
+            block.get("details")
+            or block.get("title")
+        )
+        for block in blocks
+    )
+
+
 async def answer_function_question(
     *,
     question: str,
@@ -725,17 +972,13 @@ async def answer_function_question(
         return None
 
     merged = merge_function_entries(entries)
+    overview = merged_function_overview(entries, function_name)
     topic = requested_function_topic(f"{original_question or ''} {question}")
     source_id_map, references = build_function_reference_map(entries)
     source_ids = list(dict.fromkeys(
         source_id_map.get(str(entry.get("_id") or index), f"F{index}")
         for index, entry in enumerate(entries, start=1)
     ))
-    first_description = (
-        merged["descriptions"][0]
-        if merged["descriptions"]
-        else f"La fonction {function_name} est presente dans la documentation."
-    )
     sections: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
 
@@ -766,7 +1009,7 @@ async def answer_function_question(
                 source_ids=source_ids,
             ))
 
-        if not merged["exceptions"]:
+        if not merged["exceptions"] and not has_exception_status_block(merged["status_blocks"]):
             issues.append({
                 "severity": "warning",
                 "title": "Aucune exception explicite trouvee",
@@ -814,15 +1057,50 @@ async def answer_function_question(
     else:
         sections.append({
             "title": "Role",
-            "content": first_description,
+            "content": overview["description"],
             "source_ids": source_ids,
         })
 
-        if merged["exceptions"]:
+        metadata = overview.get("metadata") or {}
+
+        if metadata:
+            sections.append({
+                "title": "Informations techniques",
+                "content": "Elements techniques identifies dans la source.",
+                "items": [
+                    {
+                        "label": "Bibliotheque",
+                        "content": metadata["library"],
+                    }
+                    for key in ("library",)
+                    if key in metadata
+                ] + [
+                    {
+                        "label": "Chemin source",
+                        "content": metadata["source_path"],
+                    }
+                    for key in ("source_path",)
+                    if key in metadata
+                ],
+                "source_ids": source_ids,
+            })
+
+        status_section = status_blocks_section_for_function(
+            function_name=function_name,
+            blocks=merged["status_blocks"],
+            source_ids=source_ids,
+        )
+
+        if status_section:
+            sections.append(status_section)
+        elif merged["exceptions"]:
             sections.append(section_from_items(
                 title="Exceptions / erreurs documentees",
-                intro="Cas d'erreur detectes dans les sources rattachees.",
-                values=merged["exceptions"][:8],
+                intro=(
+                    f"Voici les cas d'erreur ou exceptions explicitement "
+                    f"associes a la fonction {function_name}."
+                ),
+                values=merged["exceptions"],
                 empty_message="",
                 source_ids=source_ids,
             ))

@@ -35,6 +35,10 @@ from app.services.entity_consistency_service import (
 )
 from app.services.hps_ai_service import call_hps_ai
 from app.services.conversation_memory_service import resolve_documentation_query
+from app.services.field_value_decoder_service import (
+    decode_field_value_from_evidence,
+    field_value_decoding_table_block,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -274,6 +278,50 @@ def references_from_items(
         reference_from_item(item, units)
         for item in items
     ])
+
+
+def evidence_items_for_unit_ids(
+    bundle: EvidenceBundle,
+    unit_ids: list[str],
+) -> list[EvidenceItem]:
+    wanted = {
+        str(unit_id)
+        for unit_id in unit_ids
+        if unit_id
+    }
+    found = [
+        item
+        for item in all_bundle_items(bundle)
+        if item.source_unit_id in wanted
+    ]
+    found_ids = {
+        item.source_unit_id
+        for item in found
+        if item.source_unit_id
+    }
+    units = unit_by_id(bundle)
+
+    for unit_id in wanted - found_ids:
+        unit = units.get(unit_id)
+
+        if not unit:
+            continue
+
+        found.append(
+            EvidenceItem(
+                content=unit.content,
+                source_unit_id=unit.unit_id,
+                document_id=unit.document_id,
+                pdf_page=unit.source_location.pdf_page,
+                printed_page=unit.source_location.printed_page,
+                section=unit.hierarchy.title,
+                content_type=unit.content_type,
+                entity_alignment=unit.entity_alignment,
+                confidence=unit.parsing_confidence,
+            )
+        )
+
+    return found
 
 
 def reference_label(reference: dict[str, Any]) -> str:
@@ -530,6 +578,205 @@ def select_example_row(
     return rows[0] if rows else None
 
 
+def requested_code_rows(
+    bundle: EvidenceBundle,
+    codes: list[str],
+) -> tuple[list[dict[str, str]], list[EvidenceItem], list[str]]:
+    rows_by_code: dict[str, tuple[dict[str, str], EvidenceItem | None]] = {}
+
+    for row, item in zip(*code_mapping_rows(bundle)):
+        code = str(row.get("code") or "").strip().upper()
+
+        if code and code not in rows_by_code:
+            rows_by_code[code] = (row, item)
+
+    for table in bundle.tables:
+        table_rows, table_items = table_rows_for_response(table, bundle)
+        item_by_evidence_id = {
+            evidence_id_map(bundle).get(item.source_unit_id or ""): item
+            for item in table_items
+        }
+
+        for row in table_rows:
+            code = str(row.get("code") or row.get("col_1") or "").strip().upper()
+
+            if not code or code in rows_by_code:
+                continue
+
+            if "code" not in row and row.get("col_1"):
+                row = {
+                    **row,
+                    "code": str(row.get("col_1") or "").strip(),
+                    "meaning": str(row.get("col_2") or "").strip(),
+                }
+
+            rows_by_code[code] = (
+                row,
+                item_by_evidence_id.get(row.get("evidence_id")),
+            )
+
+    selected_rows: list[dict[str, str]] = []
+    selected_items: list[EvidenceItem] = []
+    missing_codes: list[str] = []
+
+    for code in codes:
+        normalized_code = str(code or "").strip().upper()
+        match = rows_by_code.get(normalized_code)
+
+        if not match:
+            missing_codes.append(normalized_code)
+            continue
+
+        row, item = match
+        selected_rows.append(row)
+
+        if item:
+            selected_items.append(item)
+
+    return selected_rows, selected_items, missing_codes
+
+
+def field_context_items(
+    bundle: EvidenceBundle,
+    requirements: AnswerRequirements,
+) -> list[EvidenceItem]:
+    items = []
+
+    if requirements.role or requirements.definition:
+        items.extend(bundle.definitions[:2])
+
+    if requirements.structure or requirements.usage or requirements.trace_usage:
+        items.extend([
+            item
+            for item in bundle.facts
+            if item.content_type in {"field_attribute", "field_usage"}
+        ][:6])
+
+    return list({
+        item.source_unit_id or f"{index}-{item.content}": item
+        for index, item in enumerate(items)
+    }.values())
+
+
+def build_requested_codes_response(
+    question: str,
+    classification: ClassificationResult,
+    bundle: EvidenceBundle,
+    requirements: AnswerRequirements | None = None,
+) -> dict[str, Any] | None:
+    requirements = requirements or extract_answer_requirements(
+        question,
+        classification,
+    )
+    field = (
+        classification.entities.field_numbers[0]
+        if classification.entities.field_numbers
+        else None
+    )
+    requested_codes = [
+        str(code).upper()
+        for code in classification.entities.codes
+        if code
+    ]
+
+    if not field or len(requested_codes) < 2:
+        return None
+
+    rows, row_items, missing_codes = requested_code_rows(
+        bundle,
+        requested_codes,
+    )
+    context_items = field_context_items(bundle, requirements)
+
+    if not rows:
+        return build_insufficient_evidence_response(
+            (
+                f"Aucun mapping fiable n'a ete retrouve pour les codes "
+                f"demandes du Field {field}: {', '.join(requested_codes)}."
+            ),
+            bundle,
+        )
+
+    all_items = [*context_items, *row_items]
+    sections: list[dict[str, Any]] = []
+    context_content = " ".join(
+        compact_text(item.content, 500)
+        for item in context_items
+        if item.content
+    )
+
+    if context_content:
+        sections.append({
+            "title": "Role, structure et usage",
+            "content": context_content,
+            "source_ids": source_ids(context_items),
+        })
+
+    sections.append({
+        "title": "Codes demandes",
+        "content": (
+            f"Voici uniquement les codes explicitement demandes pour le "
+            f"Field {field}."
+        ),
+        "blocks": [
+            {
+                "type": "table",
+                "title": f"Field {field} - codes demandes",
+                "columns": [
+                    {"key": "code", "label": "Code"},
+                    {"key": "meaning", "label": "Signification"},
+                    {"key": "reference", "label": "Reference"},
+                ],
+                "rows": rows,
+            }
+        ],
+        "source_ids": source_ids(row_items),
+    })
+
+    if requirements.example:
+        example_row = (
+            next((row for row in rows if row.get("code") == "51"), None)
+            or select_example_row(rows)
+        )
+
+        if example_row:
+            sections.append({
+                "title": "Exemple",
+                "content": (
+                    f"Si une trace contient FLD ({field}) = "
+                    f"{example_row['code']}, l'interpretation documentee est "
+                    f"\"{example_row['meaning']}\"."
+                ),
+                "source_ids": source_ids(row_items),
+            })
+
+    issues = []
+
+    if missing_codes:
+        issues.append({
+            "severity": "warning",
+            "title": "Mappings manquants",
+            "detail": (
+                "Les codes suivants ont ete demandes mais n'ont pas ete "
+                "retrouves dans les mappings structures disponibles: "
+                + ", ".join(missing_codes)
+            ),
+        })
+
+    return {
+        "summary": (
+            f"Les mappings demandes pour le Field {field} ont ete extraits "
+            "depuis les donnees structurees disponibles. Les libelles "
+            "documentaires originaux sont conserves."
+        ),
+        "sections": sections,
+        "story": [],
+        "issues": issues,
+        "recommendations": [],
+        "references": references_from_items(all_items, bundle),
+    }
+
+
 def first_code_mapping(
     bundle: EvidenceBundle,
     code: str | None,
@@ -643,6 +890,56 @@ def build_value_lookup_response(
         if classification.entities.field_numbers
         else None
     )
+    decoding = (
+        decode_field_value_from_evidence(
+            bundle=bundle,
+            field_number=field,
+            value=code,
+        )
+        if field and code
+        else None
+    )
+
+    if decoding and len(decoding.rows) >= 2:
+        decoding_items = evidence_items_for_unit_ids(bundle, decoding.source_ids)
+        sections = [
+            {
+                "title": "Valeur observee",
+                "content": f"Field {decoding.field_number} = {decoding.raw_value}",
+                "source_ids": source_ids(decoding_items),
+            },
+            {
+                "title": "Decodage par positions",
+                "content": (
+                    "La valeur est composee de sous-champs documentes. "
+                    "Le backend la decoupe selon les positions retrouvees "
+                    "dans l'EvidenceBundle."
+                ),
+                "blocks": [field_value_decoding_table_block(decoding)],
+                "source_ids": source_ids(decoding_items),
+            },
+        ]
+        issues = [
+            {
+                "severity": "warning",
+                "title": "Decodage partiel",
+                "detail": issue,
+            }
+            for issue in decoding.issues
+        ]
+
+        return {
+            "summary": (
+                f"Le Field {decoding.field_number} vaut {decoding.raw_value}. "
+                "Son interpretation doit etre lue par sous-positions."
+            ),
+            "sections": sections,
+            "story": [],
+            "issues": issues,
+            "recommendations": [],
+            "references": references_from_items(decoding_items, bundle),
+        }
+
     mapping = first_code_mapping(bundle, code)
 
     if not mapping:
@@ -1063,20 +1360,25 @@ def evidence_candidate_diagnostics(
     response: dict[str, Any] | None,
 ) -> dict[str, Any]:
     content_units = retrieval.content_units or []
+    content_type = lambda unit: (
+        unit.get("content_type")
+        if isinstance(unit, dict)
+        else getattr(unit, "content_type", None)
+    )
     table_units = [
         unit
         for unit in content_units
-        if unit.content_type == "table"
+        if content_type(unit) == "table"
     ]
     table_row_units = [
         unit
         for unit in content_units
-        if unit.content_type == "table_row"
+        if content_type(unit) == "table_row"
     ]
     code_mapping_units = [
         unit
         for unit in content_units
-        if unit.content_type == "code_mapping"
+        if content_type(unit) == "code_mapping"
     ]
     evidence_table_rows = sum(len(table.rows) for table in bundle.tables)
 
@@ -1109,6 +1411,16 @@ class EvidenceResponseWriter:
             question,
             classification,
         )
+
+        deterministic = build_requested_codes_response(
+            question,
+            classification,
+            bundle,
+            requirements,
+        )
+
+        if deterministic:
+            return deterministic
 
         if classification.intent == "TABLE_LOOKUP":
             deterministic = build_table_lookup_response(
@@ -1232,7 +1544,7 @@ async def build_evidence_bundle_for_sections(
         if classification.entities.field_numbers:
             evidence_entities["field_number"] = classification.entities.field_numbers[0]
 
-        if classification.entities.codes:
+        if len(classification.entities.codes) == 1:
             evidence_entities["code"] = classification.entities.codes[0]
 
         if classification.entities.message_types:
@@ -1325,7 +1637,7 @@ async def build_evidence_candidate(
         if classification.entities.field_numbers:
             evidence_entities["field_number"] = classification.entities.field_numbers[0]
 
-        if classification.entities.codes:
+        if len(classification.entities.codes) == 1:
             evidence_entities["code"] = classification.entities.codes[0]
 
         if classification.entities.message_types:
@@ -1568,6 +1880,56 @@ async def try_generate_table_lookup_response(
         )
 
     return candidate["response"]
+
+
+async def try_generate_requested_codes_response(
+    *,
+    question: str,
+    sections: list[dict[str, Any]],
+    original_question: str | None = None,
+    conversation_id: str | None = None,
+    memory_resolution: ResolvedConversationQuery | None = None,
+) -> dict[str, Any]:
+    classification = GenericQuestionClassifier.classify(question)
+
+    if (
+        not classification.entities.field_numbers
+        or len(classification.entities.codes) < 2
+    ):
+        raise EvidencePipelineFallback("question does not request explicit code list")
+
+    candidate = await build_evidence_candidate(
+        question=question,
+        sections=sections,
+        chunks_limit=8,
+        units_limit=None,
+        original_question=original_question,
+        conversation_id=conversation_id,
+        memory_resolution=memory_resolution,
+    )
+    response = candidate.get("response")
+
+    if response:
+        return response
+
+    deterministic = build_requested_codes_response(
+        candidate["resolved_question"],
+        candidate["classification"],
+        candidate["evidence_bundle"],
+        candidate["answer_requirements"],
+    )
+
+    if deterministic:
+        return deterministic
+
+    return build_insufficient_evidence_response(
+        (
+            "Les codes demandes ont ete detectes dans la question, mais les "
+            "mappings structures correspondants n'ont pas ete retrouves dans "
+            "l'EvidenceBundle."
+        ),
+        candidate["evidence_bundle"],
+    )
 
 
 async def shadow_evidence_response(

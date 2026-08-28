@@ -1,1 +1,388 @@
-See README.md for the full project documentation.
+# TRACE AI Platform
+
+TRACE AI Platform is a local RAG application for technical documentation and transaction trace analysis.
+
+It provides two main assistants:
+
+- **Documentation Agent**: searches, explains, and cites uploaded technical documents.
+- **Log Analysis Agent**: parses transaction traces, reconstructs functions, extracts ISO8583 fields, analyzes HSM exchanges, and displays documented anomalies.
+
+The guiding rule is:
+
+```text
+Parse deterministically where possible.
+Use RAG to retrieve the right documentary evidence.
+Use the LLM to explain, synthesize, and format the answer.
+```
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Project Structure](#project-structure)
+- [Requirements](#requirements)
+- [Environment Variables](#environment-variables)
+- [Run Locally](#run-locally)
+- [MongoDB Access](#mongodb-access)
+- [Tests](#tests)
+- [Useful Commands](#useful-commands)
+- [Architecture Overview](#architecture-overview)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Features
+
+### Documentation Agent
+
+- Upload and query PDF, DOCX, XLSX, TXT, LOG, and image files.
+- Retrieve relevant document sections with RAG.
+- Answer questions about:
+  - ISO8583 fields and values
+  - response codes and reject codes
+  - HSM command documentation
+  - technical functions from XLSX/PDF documentation
+  - concepts, sections, procedures, and examples
+- Preserve references to documents, pages, sheets, and paragraphs.
+- Support conversation memory for follow-up questions.
+
+### Log Analysis Agent
+
+- Parse transaction traces deterministically.
+- Extract:
+  - MTI
+  - FLD 002, 003, 037, 039
+  - functions / Log Story
+  - status OK, ERROR, UNKNOWN
+  - HSM interactions
+  - documented inconsistencies
+- Display structured transaction cards.
+- Generate PDF, TXT, and JSON reports.
+- Link HSM and anomaly explanations to source documentation when available.
+
+---
+
+## Project Structure
+
+```text
+Trace_project-main/
+|-- backend/
+|   |-- app/
+|   |   |-- main.py
+|   |   |-- database.py
+|   |   |-- routes/
+|   |   `-- services/
+|   |-- storage/
+|   |-- requirements.txt
+|   `-- test_*.py
+|
+|-- frontend/
+|   |-- src/
+|   |   |-- components/
+|   |   |-- services/
+|   |   `-- styles.css
+|   |-- package.json
+|   `-- vite.config.js
+|
+|-- lancer.md
+|-- PROJECT_PIPELINE.md
+`-- README.md
+```
+
+---
+
+## Requirements
+
+- Python 3.11+
+- Node.js 18+
+- Docker Desktop
+- MongoDB container named `trace-mongodb`
+- Access to the configured HPS/Ocean AI endpoint
+
+---
+
+## Environment Variables
+
+### Backend
+
+Create or update:
+
+```text
+backend/.env
+```
+
+Template:
+
+```env
+MONGODB_URL=mongodb://trace:trace123@127.0.0.1:27017/?authSource=admin
+MONGODB_DB=trace_ai
+
+OCEAN_AI_BASE_URL=https://your-ai-endpoint.example.com/api/v1/chat/completions
+OCEAN_AI_API_KEY=your_api_key_here
+HPS_AI_MODEL=openai:gpt-4o-mini
+HPS_EMBEDDING_MODEL=openai:text-embedding-3-small
+
+DOCUMENTATION_CONVERSATION_MEMORY=true
+DOCUMENTATION_EVIDENCE_SHADOW=false
+DOCUMENTATION_EVIDENCE_GENERATION=false
+```
+
+Do not commit real API keys.
+
+### Frontend
+
+Create or update:
+
+```text
+frontend/.env
+```
+
+Template:
+
+```env
+VITE_API_URL=http://127.0.0.1:8000
+```
+
+If your backend runs on port `8001`, use:
+
+```env
+VITE_API_URL=http://127.0.0.1:8001
+```
+
+---
+
+## Run Locally
+
+Use separate VS Code terminals for MongoDB, backend, and frontend.
+
+### 1. Start MongoDB
+
+```bash
+docker start trace-mongodb
+```
+
+Check that it is running:
+
+```bash
+docker ps
+```
+
+You should see:
+
+```text
+trace-mongodb
+```
+
+### 2. Start the Backend
+
+From the project root:
+
+#### PowerShell
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+#### Git Bash
+
+```bash
+cd backend
+source .venv/Scripts/activate
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Backend:
+
+```text
+http://127.0.0.1:8000
+```
+
+Swagger:
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+If port `8000` is unavailable:
+
+```bash
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
+```
+
+Then update `frontend/.env`.
+
+### 3. Start the Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Frontend:
+
+```text
+http://localhost:5173
+```
+
+---
+
+## MongoDB Access
+
+### Option A: Mongosh inside Docker
+
+```bash
+docker exec -it trace-mongodb mongosh "mongodb://trace:trace123@127.0.0.1:27017/?authSource=admin"
+```
+
+Useful commands:
+
+```javascript
+show dbs
+use trace_ai
+show collections
+db.documents.find().limit(3)
+db.document_sections.find().limit(3)
+db.conversation_memory_state.find().limit(3)
+```
+
+### Option B: Mongo Express
+
+Start Mongo Express:
+
+```bash
+docker run -d --name trace-mongo-express -p 8081:8081 ^
+  -e ME_CONFIG_MONGODB_URL="mongodb://trace:trace123@host.docker.internal:27017/?authSource=admin" ^
+  -e ME_CONFIG_BASICAUTH=false mongo-express
+```
+
+Open:
+
+```text
+http://localhost:8081
+```
+
+If the container already exists:
+
+```bash
+docker start trace-mongo-express
+```
+
+---
+
+## Tests
+
+Run backend tests from `backend/`.
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest
+```
+
+Run selected tests:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest test_conversation_memory.py
+.\.venv\Scripts\python.exe -m unittest test_function_catalog_service.py
+.\.venv\Scripts\python.exe -m unittest test_log_parser_contract.py
+```
+
+Build frontend:
+
+```bash
+cd frontend
+npm run build
+```
+
+---
+
+## Useful Commands
+
+### Install backend dependencies
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+### Install frontend dependencies
+
+```bash
+cd frontend
+npm install
+```
+
+### Stop services
+
+Backend or frontend:
+
+```text
+CTRL + C
+```
+
+MongoDB:
+
+```bash
+docker stop trace-mongodb
+```
+
+Mongo Express:
+
+```bash
+docker stop trace-mongo-express
+```
+
+---
+
+## Architecture Overview
+
+### Document Ingestion
+
+```text
+Upload
+-> extraction_service.py
+-> document_service.py
+-> MongoDB
+   -> documents
+   -> document_sections
+   -> document_content_units
+   -> document_facts
+   -> function_catalog
+```
+
+The ingestion layer extracts text, tables, sections, metadata, function rows, and structured content when available.
+
+### Documentation Agent
+
+```text
+Question
+-> conversation memory
+-> intent / context resolution
+-> retrieval
+-> evidence / synthesis
+-> normalized structured response
+-> AIResponseCard
+```
+
+The Documentation Agent should use the conversation memory only to resolve context.
+
+```text
+Memory resolves context.
+Documentation establishes facts.
+Evidence controls generation.
+```
+
+### Log Analysis Agent
+
+```text
+Trace upload
+-> deterministic parser
+-> transactions
+-> functions
+-> HSM blocks
+-> documented inconsistencies
+-> structured response
+```
+
+The parser extracts technical data before the LLM explains it.

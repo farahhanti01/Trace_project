@@ -12,8 +12,10 @@ from app.services.screenshot_analysis_service import (
     SCREEN_DIAGNOSIS,
     SCREEN_EXTRACTION,
     SCREEN_UNDERSTANDING,
+    SCREEN_VALUE_EXPLANATION,
     classify_screenshot_intent,
     extraction_response_from_visible_facts,
+    field_decoding_sections,
     image_content_parts,
     intent_requires_documentation,
     normalize_screenshot_payload,
@@ -39,6 +41,10 @@ class ScreenshotAnalysisServiceTests(unittest.TestCase):
         self.assertEqual(
             classify_screenshot_intent("que signifie le Field 039 ?"),
             DOCUMENTATION_LOOKUP,
+        )
+        self.assertEqual(
+            classify_screenshot_intent("et que signifie le Field 022 dans cette trace ?"),
+            SCREEN_VALUE_EXPLANATION,
         )
         self.assertEqual(
             classify_screenshot_intent("le PIN est bien passé ?"),
@@ -78,6 +84,33 @@ class ScreenshotAnalysisServiceTests(unittest.TestCase):
         self.assertIn("Ligne detectee", response["sections"][0]["content"])
         self.assertEqual(response["references"][0]["source"], "Screenshot")
 
+    def test_field_decoding_sections_prioritize_exact_field_value_sections(self):
+        sections = [
+            {
+                "heading": "Chapter 4 > 4.16 Field 22-Point-of-Service Entry Mode Code",
+                "field_number": "022",
+                "text": (
+                    "4.16.6 Valid Values\n"
+                    "Positions 1-2: PAN and Date Entry Mode\n"
+                    "10 Credential on file\n"
+                    "Position 3: PIN Entry Capability\n"
+                    "0 Unknown\n"
+                    "Position 4: Fill\n"
+                    "0 Unused"
+                ),
+            },
+            {
+                "heading": "Chapter 4 > 4.39 Field 39-Response Code",
+                "field_number": "039",
+                "text": "Valid Values\n00 Approved",
+            },
+        ]
+
+        matches = field_decoding_sections(sections, "022")
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["field_number"], "022")
+
     def test_extraction_response_does_not_replace_missing_field_with_documentation(self):
         response = extraction_response_from_visible_facts(
             question="extrait le champ 039",
@@ -101,6 +134,13 @@ class ScreenshotAnalysisServiceTests(unittest.TestCase):
                 intent=SCREEN_EXTRACTION,
                 question="extrait le champ 039",
                 visible_facts={"fields": []},
+            )
+        )
+        self.assertTrue(
+            intent_requires_documentation(
+                intent=SCREEN_VALUE_EXPLANATION,
+                question="et que signifie le Field 022 dans cette trace ?",
+                visible_facts={"fields": [{"field_number": "022", "value": "100"}]},
             )
         )
         self.assertTrue(

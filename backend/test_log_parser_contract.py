@@ -12,9 +12,87 @@ from app.services.log_parser_service import (
     parse_log_transactions,
     transaction_status,
 )
+from app.services.log_analysis_agent_service import (
+    build_pdf_length_documentation_findings,
+    build_field_extraction_response,
+    display_options_for_question,
+    requested_extraction_fields,
+)
 
 
 class LogParserContractTests(unittest.TestCase):
+    def test_requested_field_extraction_detects_generic_field_number(self):
+        self.assertEqual(
+            requested_extraction_fields(
+                "quelles sont les fields 039 trouves dans cette trace ?"
+            ),
+            ["039"],
+        )
+        self.assertEqual(
+            requested_extraction_fields("que signifie le field 039 ?"),
+            [],
+        )
+
+    def test_field_extraction_response_returns_observed_values_not_documentation(self):
+        transactions = parse_log_transactions(
+            "\n".join(
+                [
+                    "1301 1 2 3|5| Start DumpVisa()",
+                    "1301 1 2 3|5| - M.T.I      : [0110]",
+                    "1301 1 2 3|5| - FLD (037) : (012) : [601318105410]",
+                    "1301 1 2 3|5| - FLD (039) : (002) : [55]",
+                    "1301 1 2 3|5| End DumpVisa(OK)",
+                ]
+            ),
+            "trace.txt",
+        )
+
+        response = build_field_extraction_response(
+            transactions=transactions,
+            fields=["039"],
+            display_options=display_options_for_question(
+                "quelles sont les fields 039 trouves dans cette trace ?"
+            ),
+        )
+
+        rows = response["sections"][0]["blocks"][0]["rows"]
+        self.assertEqual(rows[0]["field"], "039")
+        self.assertEqual(rows[0]["value"], "55")
+        self.assertEqual(response["references"], [])
+        self.assertEqual(response["transactions"], [])
+
+    def test_fixed_length_check_uses_declared_trace_length_and_preserves_spaces(self):
+        transactions = parse_log_transactions(
+            "\n".join(
+                [
+                    "1301 1 2 3|5| Start DumpVisa()",
+                    "1301 1 2 3|5| - M.T.I      : [0100]",
+                    "1301 1 2 3|5| - FLD (043) : (040) : [APPLE.COM/BILL    CORK       IRL]",
+                    "1301 1 2 3|5| End DumpVisa(OK)",
+                ]
+            ),
+            "trace.txt",
+        )
+
+        self.assertEqual(transactions[0]["field_lengths"]["043"], 40)
+
+        findings = build_pdf_length_documentation_findings(
+            transaction=transactions[0],
+            field_length_rules={
+                "043": {
+                    "expected": 40,
+                    "expected_condition": "Longueur fixe 40 ANS",
+                    "source_reference": {
+                        "source": "doc.pdf",
+                        "page": 204,
+                    },
+                    "rule_text": "Field 043 has fixed length 40 ANS.",
+                }
+            },
+        )
+
+        self.assertEqual(findings, [])
+
     def test_mti_0200_uses_authorization_request_label(self):
         self.assertEqual(mti_label("0200"), "Authorization Request")
 

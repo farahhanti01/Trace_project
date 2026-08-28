@@ -10,8 +10,12 @@ PROJECT_ROOT = BACKEND_ROOT.parent
 sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.main import StructuredResponse
+from app.models.conversation_memory import ConversationMemoryState
 from app.services.chat_intent_router import classify_chat_workflow
-from app.services.documentation_agent_service import normalize_agent_response
+from app.services.documentation_agent_service import (
+    merge_document_context_ids,
+    normalize_agent_response,
+)
 from app.services.documentation_synthesis_service import (
     ResponsePlanner,
     dedupe_code_rows,
@@ -28,6 +32,29 @@ from app.services.documentation_synthesis_service import (
 
 
 class DocumentationAgentContractTests(unittest.TestCase):
+    def test_document_context_merges_current_references_with_memory(self):
+        memory_state = ConversationMemoryState(
+            conversation_id="conversation-1",
+            active_document_ids=["doc-a", "doc-b"],
+        )
+
+        document_ids = merge_document_context_ids(
+            ["doc-b", "doc-c"],
+            memory_state,
+        )
+
+        self.assertEqual(document_ids, ["doc-b", "doc-c", "doc-a"])
+
+    def test_document_context_uses_memory_when_followup_has_no_reference(self):
+        memory_state = ConversationMemoryState(
+            conversation_id="conversation-1",
+            active_document_ids=["doc-a"],
+        )
+
+        document_ids = merge_document_context_ids([], memory_state)
+
+        self.assertEqual(document_ids, ["doc-a"])
+
     def test_structured_response_keeps_sections_and_references(self):
         response = StructuredResponse(
             summary="Resume",
@@ -659,6 +686,271 @@ class DocumentationAgentContractTests(unittest.TestCase):
             "05",
             {row["code"] for row in blocks[1]["rows"]},
         )
+
+    def test_requested_code_values_get_real_table_without_table_word(self):
+        question = (
+            "Depuis le document BASE I Technical Specifications, explique le Field 039. "
+            "Je veux les valeurs importantes 00, 05, 51, 55 et leur signification exacte."
+        )
+        response = enforce_value_table_when_requested(
+            payload={
+                "summary": "Le Field 039 est le code de reponse.",
+                "sections": [
+                    {
+                        "title": "Valeurs et significations",
+                        "content": (
+                            "Les valeurs importantes du Field 039 et leur "
+                            "signification sont les suivantes"
+                        ),
+                        "blocks": [
+                            {
+                                "type": "paragraph",
+                                "content": "Les valeurs importantes sont les suivantes.",
+                            }
+                        ],
+                        "source_ids": ["S1"],
+                    }
+                ],
+            },
+            knowledge={
+                "facts": [
+                    {
+                        "category": "value",
+                        "fact": "Response code 00 means Approbation.",
+                        "source_ids": ["S1"],
+                    },
+                    {
+                        "category": "value",
+                        "fact": "Response code 05 means Refus.",
+                        "source_ids": ["S1"],
+                    },
+                    {
+                        "category": "value",
+                        "fact": "Response code 10 means Partial approval.",
+                        "source_ids": ["S1"],
+                    },
+                    {
+                        "category": "value",
+                        "fact": "Response code 51 means Transaction non permise.",
+                        "source_ids": ["S1"],
+                    },
+                    {
+                        "category": "value",
+                        "fact": "Response code 55 means Carte signalee comme perdue ou volee.",
+                        "source_ids": ["S1"],
+                    },
+                ]
+            },
+            plan=[],
+            selected_sections=[
+                {
+                    "source_id": "S1",
+                    "text": (
+                        "Table 4-18 Field 39 Response Codes "
+                        "Code Definition "
+                        "00 Successful approval/completion "
+                        "05 Do not honor "
+                        "10 Partial approval "
+                        "51 Insufficient funds "
+                        "55 Incorrect PIN"
+                    ),
+                }
+            ],
+            question=question,
+        )
+        table_blocks = [
+            block
+            for section in response["sections"]
+            for block in section.get("blocks") or []
+            if block.get("type") == "table"
+        ]
+        rows = table_blocks[0]["rows"]
+
+        self.assertEqual([row["code"] for row in rows], ["00", "05", "51", "55"])
+        self.assertEqual(rows[2]["meaning"], "Insufficient funds")
+        self.assertNotIn("Partial approval", str(response))
+        self.assertNotIn("Transaction non permise", str(response))
+        self.assertNotIn("Carte signalee", str(response))
+
+    def test_requested_code_values_replace_generated_table_with_source_rows(self):
+        question = (
+            "Depuis le document BASE I Technical Specifications, explique le Field 039. "
+            "Je veux les valeurs importantes 00, 05, 51, 55 et leur signification exacte."
+        )
+        response = enforce_value_table_when_requested(
+            payload={
+                "summary": "Le Field 039 est le code de reponse.",
+                "sections": [
+                    {
+                        "title": "Valeurs et significations",
+                        "content": "",
+                        "blocks": [
+                            {
+                                "type": "table",
+                                "columns": [
+                                    {"key": "code", "label": "Code"},
+                                    {"key": "meaning", "label": "Signification"},
+                                ],
+                                "rows": [
+                                    {"code": "00", "meaning": "Approbation de la transaction."},
+                                    {"code": "05", "meaning": "Refus de la transaction."},
+                                    {"code": "51", "meaning": "Fonds insuffisants."},
+                                    {"code": "55", "meaning": "Echec de la verification du titulaire."},
+                                ],
+                            }
+                        ],
+                        "source_ids": ["S1"],
+                    }
+                ],
+            },
+            knowledge={},
+            plan=[],
+            selected_sections=[
+                {
+                    "source_id": "S1",
+                    "text": (
+                        "Table 4-18 Field 39 Response Codes "
+                        "Code Definition "
+                        "00 Successful approval/completion "
+                        "05 Do not honor "
+                        "51 Insufficient funds "
+                        "55 Incorrect PIN"
+                    ),
+                }
+            ],
+            question=question,
+        )
+        table_blocks = [
+            block
+            for section in response["sections"]
+            for block in section.get("blocks") or []
+            if block.get("type") == "table"
+        ]
+        rows = table_blocks[0]["rows"]
+
+        self.assertEqual([row["code"] for row in rows], ["00", "05", "51", "55"])
+        self.assertEqual(rows[0]["meaning"], "Successful approval/completion")
+        self.assertEqual(rows[1]["meaning"], "Do not honor")
+        self.assertEqual(rows[2]["meaning"], "Insufficient funds")
+        self.assertEqual(rows[3]["meaning"], "Incorrect PIN")
+
+    def test_requested_code_values_do_not_parse_narrative_fragments(self):
+        question = (
+            "Depuis le document BASE I Technical Specifications, explique le Field 039. "
+            "Je veux les valeurs importantes 00, 05, 51, 55 et leur signification exacte."
+        )
+        response = enforce_value_table_when_requested(
+            payload={
+                "summary": "Le Field 039 est le code de reponse.",
+                "sections": [
+                    {
+                        "title": "Valeurs et significations",
+                        "content": "",
+                        "blocks": [
+                            {
+                                "type": "table",
+                                "columns": [
+                                    {"key": "code", "label": "Code"},
+                                    {"key": "meaning", "label": "Signification"},
+                                ],
+                                "rows": [
+                                    {
+                                        "code": "00",
+                                        "meaning": (
+                                            "and others) before the response is sent "
+                                            "to the acquirer"
+                                        ),
+                                    },
+                                    {
+                                        "code": "05",
+                                        "meaning": "should be used for declines",
+                                    },
+                                    {
+                                        "code": "51",
+                                        "meaning": ") to issuers when they are available",
+                                    },
+                                    {"code": "55", "meaning": "Tag"},
+                                ],
+                            }
+                        ],
+                        "source_ids": ["S1"],
+                    }
+                ],
+            },
+            knowledge={},
+            plan=[],
+            selected_sections=[
+                {
+                    "source_id": "S1",
+                    "text": (
+                        "A referral or negative response code 00 and others before "
+                        "the response is sent to the acquirer. Code 05 should be "
+                        "used for declines. The issuer must return a value of 51 "
+                        "to issuers when they are available. Tag 55 appears in "
+                        "another paragraph."
+                    ),
+                }
+            ],
+            question=question,
+        )
+        response_text = json.dumps(response, ensure_ascii=False)
+        table_blocks = [
+            block
+            for section in response.get("sections") or []
+            for block in section.get("blocks") or []
+            if block.get("type") == "table"
+        ]
+
+        self.assertEqual(table_blocks, [])
+        self.assertIn("Table de codes non confirmee", response_text)
+        self.assertNotIn("should be used for declines", response_text)
+        self.assertNotIn("to the acquirer", response_text)
+        self.assertNotIn("Fonds insuffisants", str(response))
+        self.assertNotIn("Echec de la verification", str(response))
+
+    def test_requested_code_warning_is_not_duplicated_after_repair_pass(self):
+        question = (
+            "Depuis le document BASE I Technical Specifications, explique le Field 039. "
+            "Je veux les valeurs importantes 00, 05, 51, 55 et leur signification exacte."
+        )
+        payload = {
+            "summary": "Le Field 039 est le code de reponse.",
+            "sections": [
+                {
+                    "title": "Valeurs et significations",
+                    "content": "Les valeurs importantes pour le Field 039 incluent",
+                    "blocks": [
+                        {
+                            "type": "paragraph",
+                            "content": "Les valeurs importantes pour le Field 039 incluent",
+                        }
+                    ],
+                    "source_ids": ["S1"],
+                }
+            ],
+            "issues": [],
+        }
+        kwargs = {
+            "knowledge": {},
+            "plan": [],
+            "selected_sections": [
+                {
+                    "source_id": "S1",
+                    "text": "Response code 00 appears in a narrative paragraph only.",
+                }
+            ],
+            "question": question,
+        }
+
+        first_pass = enforce_value_table_when_requested(payload=payload, **kwargs)
+        second_pass = enforce_value_table_when_requested(payload=first_pass, **kwargs)
+        response_text = json.dumps(second_pass, ensure_ascii=False)
+
+        self.assertEqual(
+            response_text.count("Table de codes non confirmee"),
+            1,
+        )
+        self.assertEqual(second_pass.get("sections"), [])
 
     def test_field_039_table_extracts_codes_from_pdf_table_text(self):
         question = (

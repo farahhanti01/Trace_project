@@ -360,6 +360,11 @@ class AdaptiveRetriever:
             "document_id": {"$in": document_ids},
         }
         field_number = first_entity_value(plan.entities, "field_numbers")
+        codes = [
+            str(code)
+            for code in plan.entities.get("codes", [])
+            if code
+        ]
         code = first_entity_value(plan.entities, "codes")
         message_type = first_entity_value(plan.entities, "message_types")
 
@@ -368,13 +373,29 @@ class AdaptiveRetriever:
         if plan.intent == "VALUE_LOOKUP" and field_number and code:
             exact_query.update({
                 "entities.field_number": field_number,
-                "entities.code": code,
+                "entities.code": {"$in": codes} if len(codes) > 1 else code,
                 "content_type": {"$in": ["code_mapping", "table_row"]},
             })
             strategies_used.append("structured_exact_lookup")
             units = await document_content_units_collection.find(exact_query).to_list(
-                length=limit
+                length=max(limit, 500) if len(codes) > 1 else limit
             )
+            if len(codes) > 1:
+                context_units = await document_content_units_collection.find({
+                    **base_query,
+                    "entities.field_number": field_number,
+                    "content_type": {
+                        "$in": [
+                            "field_description",
+                            "field_attribute",
+                            "field_usage",
+                            "definition",
+                            "table",
+                        ]
+                    },
+                }).to_list(length=limit)
+                units.extend(context_units)
+                strategies_used.append("structured_field_context_for_codes")
         elif plan.intent == "TABLE_LOOKUP" and field_number:
             exact_query.update({
                 "entities.field_number": field_number,
@@ -664,17 +685,27 @@ class AdaptiveRetriever:
     ) -> RetrievalCompleteness:
         missing = []
         field_number = first_entity_value(plan.entities, "field_numbers")
+        codes = [
+            str(code)
+            for code in plan.entities.get("codes", [])
+            if code
+        ]
         code = first_entity_value(plan.entities, "codes")
 
         if plan.intent == "VALUE_LOOKUP":
-            has_code = any(
-                (unit.get("entities") or {}).get("code") == code
-                and unit.get("content_type") in {"code_mapping", "table_row"}
-                for unit in units
-            )
+            expected_codes = codes or ([code] if code else [])
 
-            if field_number and code and not has_code:
-                missing.append(f"exact mapping for field {field_number} code {code}")
+            retrieved_codes = {
+                (unit.get("entities") or {}).get("code")
+                for unit in units
+                if unit.get("content_type") in {"code_mapping", "table_row"}
+            }
+
+            for expected_code in expected_codes:
+                if field_number and expected_code not in retrieved_codes:
+                    missing.append(
+                        f"exact mapping for field {field_number} code {expected_code}"
+                    )
 
         if plan.intent == "TABLE_LOOKUP":
             has_table_rows = any(

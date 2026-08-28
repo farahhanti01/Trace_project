@@ -68,6 +68,75 @@ INLINE_MEDIA_TYPES = {
 }
 
 
+def stored_document_path(document: dict[str, Any]) -> Path | None:
+    relative_path = document.get("relative_path")
+
+    if not relative_path:
+        return None
+
+    return BACKEND_ROOT / relative_path
+
+
+async def resolve_stored_document_path(document: dict[str, Any]) -> Path:
+    file_path = stored_document_path(document)
+
+    if file_path and file_path.exists():
+        return file_path
+
+    filename = document.get("original_filename")
+    extension = document.get("extension")
+
+    if filename and extension:
+        base_query: dict[str, Any] = {
+            "original_filename": filename,
+            "extension": extension,
+            "relative_path": {"$exists": True},
+        }
+        queries: list[dict[str, Any]] = []
+
+        if document.get("file_hash"):
+            queries.append({
+                **base_query,
+                "file_hash": document["file_hash"],
+            })
+
+        if document.get("size") is not None:
+            queries.append({
+                **base_query,
+                "size": document["size"],
+            })
+
+        queries.append(base_query)
+
+        seen_candidate_ids = set()
+
+        for query in queries:
+            candidates = await documents_collection.find(query).sort([
+                ("updated_at", -1),
+                ("created_at", -1),
+            ]).to_list(length=250)
+
+            for candidate in candidates:
+                candidate_id = str(candidate.get("_id") or "")
+
+                if candidate_id in seen_candidate_ids:
+                    continue
+
+                seen_candidate_ids.add(candidate_id)
+                candidate_path = stored_document_path(candidate)
+
+                if candidate_path and candidate_path.exists():
+                    return candidate_path
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            "Stored file not found. The document metadata exists, but the "
+            "original file is missing from backend/storage/documents."
+        ),
+    )
+
+
 def require_object_id(
     value: str,
     label: str = "ID",
@@ -286,13 +355,7 @@ async def admin_download_document(
             detail="Document not found.",
         )
 
-    file_path = BACKEND_ROOT / document["relative_path"]
-
-    if not file_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Stored file not found.",
-        )
+    file_path = await resolve_stored_document_path(document)
 
     return FileResponse(
         path=file_path,
@@ -314,13 +377,7 @@ async def admin_view_document(
             detail="Document not found.",
         )
 
-    file_path = BACKEND_ROOT / document["relative_path"]
-
-    if not file_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Stored file not found.",
-        )
+    file_path = await resolve_stored_document_path(document)
 
     extension = document.get("extension")
     media_type = (
@@ -400,13 +457,7 @@ async def admin_preview_pdf_page(
             detail="Preview is only available for PDF documents.",
         )
 
-    file_path = BACKEND_ROOT / document["relative_path"]
-
-    if not file_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Stored file not found.",
-        )
+    file_path = await resolve_stored_document_path(document)
 
     with fitz.open(file_path) as pdf:
         if pdf.page_count == 0:
@@ -458,13 +509,7 @@ async def admin_view_highlighted_pdf(
             detail="Highlighted view is only available for PDF documents.",
         )
 
-    file_path = BACKEND_ROOT / document["relative_path"]
-
-    if not file_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Stored file not found.",
-        )
+    file_path = await resolve_stored_document_path(document)
 
     with fitz.open(file_path) as pdf:
         if pdf.page_count == 0:

@@ -1,7 +1,6 @@
-import React, { useState } from 'react'
-import { FileText, AlertTriangle, CheckCircle2, BookOpen, ScrollText, Download, X, ZoomIn } from 'lucide-react'
+import React, { useEffect, useState } from 'react'
+import { FileText, AlertTriangle, CheckCircle2, BookOpen, ScrollText, Download, X, ZoomIn, ChevronRight } from 'lucide-react'
 import {
-  getAdminDocumentHighlightedViewUrl,
   getAdminDocumentPagePreviewUrl,
   getAdminDocumentViewUrl,
 } from '../services/api'
@@ -132,7 +131,7 @@ export function AIResponseCard({ data, onDocumentPreview }) {
                       </p>
                     ))
                   ) : (
-                    section.content && <p className="response-doc-section__paragraph">{displayValue(section.content)}</p>
+                    section.content && <StructuredTextContent value={section.content} />
                   )}
                   {items.length > 0 && (
                     <ul className="response-doc-section__items">
@@ -281,6 +280,98 @@ function ResponseBlock({ block }) {
   }
 }
 
+function StructuredTextContent({ value }) {
+  const table = parseStructuredTextTable(value)
+
+  if (table) {
+    return <ResponseTable table={table} />
+  }
+
+  return <p className="response-doc-section__paragraph">{displayValue(value)}</p>
+}
+
+function parseStructuredTextTable(value) {
+  const rows = extractStructuredRows(value)
+
+  if (!rows.length) return null
+
+  const keys = collectRowKeys(rows)
+  if (!keys.length) return null
+
+  return {
+    type: 'table',
+    title: 'Donnees extraites',
+    columns: keys.map((key) => ({
+      key,
+      label: labelForStructuredKey(key),
+    })),
+    rows,
+  }
+}
+
+function extractStructuredRows(value) {
+  if (Array.isArray(value)) {
+    return value.filter((row) => row && typeof row === 'object' && !Array.isArray(row))
+  }
+
+  if (typeof value !== 'string') return []
+
+  const text = value.trim()
+  if (!text.startsWith('[') || !text.includes('{') || !text.includes('}')) return []
+
+  try {
+    const parsed = JSON.parse(text)
+    if (Array.isArray(parsed)) {
+      return parsed.filter((row) => row && typeof row === 'object' && !Array.isArray(row))
+    }
+  } catch (_error) {
+    // Some backend payloads currently arrive as Python repr strings with single quotes.
+  }
+
+  const objectChunks = text.match(/\{[^{}]*\}/g) ?? []
+
+  return objectChunks
+    .map((chunk) => {
+      const row = {}
+
+      for (const match of chunk.matchAll(/['"]([^'"]+)['"]\s*:\s*(['"])(.*?)\2/g)) {
+        row[match[1]] = match[3]
+      }
+
+      return row
+    })
+    .filter((row) => Object.keys(row).length > 0)
+}
+
+function collectRowKeys(rows) {
+  const keys = []
+
+  rows.forEach((row) => {
+    Object.keys(row).forEach((key) => {
+      if (!keys.includes(key)) keys.push(key)
+    })
+  })
+
+  return keys
+}
+
+function labelForStructuredKey(key) {
+  const labels = {
+    field: 'Field',
+    longueur_indiquee: 'Longueur indiquee',
+    valeur_observee: 'Valeur observee',
+    value: 'Valeur',
+    source: 'Source',
+    status: 'Statut',
+  }
+
+  if (labels[key]) return labels[key]
+
+  return key
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
 function deduplicateBlocks(blocks = []) {
   const seen = new Set()
 
@@ -414,7 +505,7 @@ function getDisplayOptions(data) {
     analysis_mode: 'log',
     show_fields: true,
     show_log_story: true,
-    show_hsm: false,
+    show_hsm: true,
     show_documentation_findings: true,
     ...(data.display_options ?? {}),
   }
@@ -470,6 +561,7 @@ function TransactionDownloads({ data }) {
 }
 
 function TransactionCard({ transaction, displayOptions, colorIndex = 0, onPreviewDocument }) {
+  const [isExpanded, setIsExpanded] = useState(false)
   const fields = transaction.fields && typeof transaction.fields === 'object' && !Array.isArray(transaction.fields)
     ? transaction.fields
     : {}
@@ -488,41 +580,74 @@ function TransactionCard({ transaction, displayOptions, colorIndex = 0, onPrevie
       && !displayOptions.show_fields
     )
   )
+  const mti = transaction.mti ?? transaction.message_type ?? fields.mti ?? 'N/A'
+  const field002 = fields['002'] ?? 'N/A'
+  const field003 = fields['003'] ?? 'N/A'
+  const field039 = fields['039'] ?? 'N/A'
+  const cardTitle = hsmOnly
+    ? `HSM Analysis #${transaction.log_index ?? 'N/A'}${hsmThread ? ` - Thread ${hsmThread}` : ''}`
+    : field037
 
   return (
-    <article className={`transaction-card transaction-card--tone-${colorIndex} transaction-card--${statusTone}`}>
-      <div className="transaction-card__header">
-        <div>
-          <div className="transaction-card__title">
+    <article className={`transaction-card transaction-card--tone-${colorIndex} transaction-card--${statusTone}${isExpanded ? ' transaction-card--expanded' : ''}`}>
+      <button
+        type="button"
+        className="transaction-card__summary"
+        onClick={() => setIsExpanded((current) => !current)}
+        aria-expanded={isExpanded}
+      >
+        <span className="transaction-card__summary-left">
+          <ChevronRight className="transaction-card__chevron" />
+          <span className="transaction-card__title">
             {hsmOnly ? (
-              `HSM Analysis #${transaction.log_index ?? 'N/A'}${hsmThread ? ` - Thread ${hsmThread}` : ''}`
+              cardTitle
             ) : (
               <>
-                FLD 037{' '}
-                <strong className="transaction-card__highlight">{field037}</strong>
+                <span className="transaction-card__label">FLD 037</span>
+                <strong className="transaction-card__highlight">{cardTitle}</strong>
               </>
             )}
-          </div>
-        </div>
+          </span>
+          {!hsmOnly && (
+            <span className="transaction-card__chips" aria-label="Transaction fields">
+              <TransactionChip label="MTI" value={mti} />
+              <TransactionChip label="FLD002" value={field002} />
+              <TransactionChip label="FLD003" value={field003} />
+              <TransactionChip label="FLD039" value={field039} />
+            </span>
+          )}
+        </span>
         <span className={`transaction-status transaction-status--${statusTone}`}>
           {transaction.status ?? 'UNKNOWN'}
         </span>
-      </div>
+      </button>
 
-      {displayOptions.show_fields && <FieldGrid fields={fields} />}
-      {displayOptions.show_log_story && <LogStory story={logStory} />}
-      {displayOptions.show_hsm && (
-        <HsmAnalysis
-          hsm={hsmAnalysis}
-          onPreviewDocument={onPreviewDocument}
-        />
+      {isExpanded && (
+        <div className="transaction-card__details">
+          {displayOptions.show_log_story && <LogStory story={logStory} />}
+          {displayOptions.show_hsm && (
+            <HsmAnalysis
+              hsm={hsmAnalysis}
+              onPreviewDocument={onPreviewDocument}
+            />
+          )}
+          {/* <TextList title="Observed Facts" items={transaction.observed_facts} /> */}
+          {displayOptions.show_documentation_findings && (
+            <DocumentationFindings findings={transaction.documentation_findings} />
+          )}
+          {/* <ReferenceList title="Sources" items={transaction.sources} /> */}
+        </div>
       )}
-      {/* <TextList title="Observed Facts" items={transaction.observed_facts} /> */}
-      {displayOptions.show_documentation_findings && (
-        <DocumentationFindings findings={transaction.documentation_findings} />
-      )}
-      {/* <ReferenceList title="Sources" items={transaction.sources} /> */}
     </article>
+  )
+}
+
+function TransactionChip({ label, value }) {
+  return (
+    <span className="transaction-chip">
+      <span>{label}</span>
+      <strong>{displayValue(value)}</strong>
+    </span>
   )
 }
 
@@ -689,6 +814,10 @@ function HsmCommandCard({ command, onPreviewDocument }) {
   const uniqueReferences = deduplicateReferences(references)
   const resultDescription = hsmDescription(command)
   const resultSearchText = command.documented_return_code_line || resultDescription
+  const isFailureResult = (
+    String(command.status ?? '').toUpperCase() === 'FAILED'
+    || /\b(fail|failure|failed|erreur|error|nok|decline|refus)\b/i.test(resultDescription)
+  )
 
   return (
     <div className="hsm-command">
@@ -722,7 +851,9 @@ function HsmCommandCard({ command, onPreviewDocument }) {
             <div className="hsm-command__result-help-grid">
               <div className="hsm-command__result-help-content">
                 <b>Signification du HsmResultCode</b>
-                <p>{resultDescription}</p>
+                <p className={isFailureResult ? 'hsm-command__result-meaning hsm-command__result-meaning--danger' : 'hsm-command__result-meaning'}>
+                  {resultDescription}
+                </p>
                 {uniqueReferences.length > 0 && (
                   <div className="hsm-command__references">
                     {uniqueReferences.map((reference, index) => (
@@ -826,21 +957,10 @@ function referenceUrl(reference, searchText = '') {
   if (!documentId) return ''
 
   const page = reference.pdf_page ?? reference.page
-  const source = String(reference.source || reference.original_source || '').toLowerCase()
-  const isPdf = source.includes('.pdf')
   const fragments = []
 
   if (page !== undefined && page !== null) {
     fragments.push(`page=${encodeURIComponent(page)}`)
-  }
-
-  if (isPdf && searchText) {
-    const highlightedUrl = getAdminDocumentHighlightedViewUrl(documentId, {
-      page,
-      search: searchText,
-    })
-
-    return `${highlightedUrl}${page !== undefined && page !== null ? `#page=${encodeURIComponent(page)}` : ''}`
   }
 
   if (searchText) {
@@ -907,6 +1027,7 @@ function ReferencePill({ reference, searchText = '', onPreview }) {
 
 export function DocumentPreviewPanel({ preview, onClose }) {
   const [isZoomOpen, setIsZoomOpen] = useState(false)
+  const [previewFailed, setPreviewFailed] = useState(false)
   const reference = preview.reference
   const searchText = preview.searchText ?? ''
   const label = preview.label ?? formatReference(reference)
@@ -916,8 +1037,32 @@ export function DocumentPreviewPanel({ preview, onClose }) {
     page,
     search: searchText,
   })
-  const viewUrl = documentViewUrl(reference)
+  const viewUrl = referenceUrl(reference, searchText) || documentViewUrl(reference)
   const title = reference.section || reference.heading || reference.source || 'Document'
+
+  useEffect(() => {
+    setPreviewFailed(false)
+    setIsZoomOpen(false)
+  }, [previewUrl])
+
+  const previewContent = previewFailed ? (
+    <div className="document-side-preview__error">
+      <AlertTriangle />
+      <div>
+        <strong>Apercu indisponible</strong>
+        <p>
+          Le fichier original n'est pas accessible dans le stockage local.
+          Reuploade le document si le bouton d'ouverture ne fonctionne pas.
+        </p>
+      </div>
+    </div>
+  ) : (
+    <img
+      src={previewUrl}
+      alt={`Apercu du document page ${page}`}
+      onError={() => setPreviewFailed(true)}
+    />
+  )
 
   return (
     <aside className="document-side-preview" aria-label="Apercu du document">
@@ -943,7 +1088,7 @@ export function DocumentPreviewPanel({ preview, onClose }) {
         onClick={() => setIsZoomOpen(true)}
         title="Agrandir l'aperçu"
       >
-        <img src={previewUrl} alt={`Apercu du document page ${page}`} />
+        {previewContent}
         <span className="document-side-preview__zoom-hint">
           <ZoomIn />
           Agrandir
@@ -986,7 +1131,23 @@ export function DocumentPreviewPanel({ preview, onClose }) {
               </button>
             </div>
             <div className="document-zoom__canvas">
-              <img src={previewUrl} alt={`Apercu agrandi du document page ${page}`} />
+              {previewFailed ? (
+                <div className="document-side-preview__error">
+                  <AlertTriangle />
+                  <div>
+                    <strong>Apercu indisponible</strong>
+                    <p>
+                      Le fichier original n'est pas accessible dans le stockage local.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <img
+                  src={previewUrl}
+                  alt={`Apercu agrandi du document page ${page}`}
+                  onError={() => setPreviewFailed(true)}
+                />
+              )}
             </div>
             <a
               className="document-side-preview__open"
@@ -1068,39 +1229,63 @@ function HsmDetail({ label, value, mono, multiline }) {
 }
 
 function LogStory({ story }) {
+  const [isExpanded, setIsExpanded] = useState(false)
   const rows = Array.isArray(story) ? story : []
 
   if (rows.length === 0) return null
 
+  const errorCount = rows.filter((item) => item.status === 'ERROR').length
+  const warningCount = rows.filter((item) => item.status === 'WARNING').length
+  const unknownCount = rows.filter((item) => item.status === 'UNKNOWN').length
+
   return (
     <div className="transaction-section">
-      <h5 className="transaction-section__title">Fonctions</h5>
-      <div className="log-story">
-        {rows.map((item, index) => (
-          <LogStoryRow key={`${item.function_name}-${index}`} item={item} />
-        ))}
-      </div>
+      <button
+        type="button"
+        className="function-block__summary"
+        onClick={() => setIsExpanded((current) => !current)}
+        aria-expanded={isExpanded}
+      >
+        <span className="function-block__summary-main">
+          <ChevronRight className="function-block__chevron" />
+          <span className="transaction-section__title function-block__title">Fonctions</span>
+          <strong>{rows.length}</strong>
+        </span>
+        <span className="function-block__chips">
+          {errorCount > 0 && <span className="function-block__chip function-block__chip--error">{errorCount} erreur(s)</span>}
+          {warningCount > 0 && <span className="function-block__chip function-block__chip--warning">{warningCount} warning(s)</span>}
+          {unknownCount > 0 && <span className="function-block__chip">{unknownCount} unknown</span>}
+        </span>
+      </button>
+
+      {isExpanded && (
+        <div className="log-story">
+          {rows.map((item, index) => (
+            <LogStoryRow key={`${item.function_name}-${index}`} item={item} />
+          ))}
+        </div>
+      )}
     </div>
   )
 }
 
 function LogStoryRow({ item }) {
-  const [open, setOpen] = useState(false)
   const hasError = item.status === 'ERROR' && item.error
+  const errorType = functionErrorType(item)
 
   return (
     <div className="log-story__row">
       <span className="log-story__order">{item.order}</span>
       <span className="log-story__name">{item.function_name}</span>
+      {errorType && <span className="log-story__error-chip">{errorType}</span>}
       <span className={`log-story__status log-story__status--${String(item.status ?? 'unknown').toLowerCase()}`}>
         {item.status ?? 'UNKNOWN'}
       </span>
       {hasError && (
-        <button type="button" className="log-story__more" onClick={() => setOpen((value) => !value)}>
-          En savoir plus
-        </button>
+        <div className="log-story__details">
+          <ErrorDetails error={item.error} />
+        </div>
       )}
-      {open && hasError && <ErrorDetails error={item.error} />}
     </div>
   )
 }
@@ -1221,29 +1406,66 @@ function DocumentationFindings({ findings }) {
       <h5 className="transaction-section__title">Inconformités documentées</h5>
       <div className="doc-finding-list">
         {visibleFindings.map((finding, index) => (
-          <div key={index} className="doc-finding">
-            <span className="doc-finding__status-icon" aria-hidden="true">
-              <AlertTriangle />
-            </span>
-            <strong>{displayValue(finding.anomaly ?? finding.title ?? 'Anomaly justification')}</strong>
-            {finding.field && <p>Champ: {displayValue(finding.field)}</p>}
-            {finding.observed_value && <p>Valeur observee: {displayValue(finding.observed_value)}</p>}
-            {finding.expected_condition && <p>Condition attendue: {displayValue(finding.expected_condition)}</p>}
-            {finding.context && <p>Contexte: {displayValue(finding.context)}</p>}
-            {finding.expected_rule && <p>Regle documentaire: {displayValue(finding.expected_rule)}</p>}
-            {finding.explanation && <p>{displayValue(finding.explanation)}</p>}
-            {finding.conclusion && <p>{displayValue(finding.conclusion)}</p>}
-            {(finding.source || finding.page || finding.paragraph) && (
-              <p>
-                Source: {displayValue(finding.source ?? 'PDF')}
-                {finding.page !== undefined && finding.page !== null ? ` - p.${finding.page}` : ''}
-                {finding.paragraph !== undefined && finding.paragraph !== null ? ` - para. ${finding.paragraph}` : ''}
-              </p>
-            )}
-          </div>
+          <DocumentationFindingCard key={index} finding={finding} />
         ))}
       </div>
     </div>
+  )
+}
+
+function DocumentationFindingCard({ finding }) {
+  const title = displayValue(finding.anomaly ?? finding.title ?? 'Anomaly justification')
+  const source = [
+    displayValue(finding.source ?? ''),
+    finding.page !== undefined && finding.page !== null ? `p.${finding.page}` : '',
+    finding.paragraph !== undefined && finding.paragraph !== null ? `para. ${finding.paragraph}` : '',
+  ].filter(Boolean).join(' - ')
+
+  return (
+    <article className="doc-finding">
+      <header className="doc-finding__header">
+        <span className="doc-finding__title">
+          <span className="doc-finding__status-icon" aria-hidden="true">
+            <AlertTriangle />
+          </span>
+          <strong>{title}</strong>
+        </span>
+        <span className="doc-finding__context">
+          {finding.context ? displayValue(finding.context) : 'Documentation'}
+        </span>
+      </header>
+
+      <div className="doc-finding__compare">
+        <div className="doc-finding__metric doc-finding__metric--observed">
+          <span>Observe</span>
+          <strong>{displayValue(finding.observed_value ?? 'Non renseigne')}</strong>
+          {finding.field && <small>Champ {displayValue(finding.field)}</small>}
+        </div>
+        <div className="doc-finding__metric doc-finding__metric--expected">
+          <span>Attendu</span>
+          <strong>{displayValue(finding.expected_condition ?? 'Non renseigne')}</strong>
+        </div>
+        <div className="doc-finding__metric doc-finding__metric--gap">
+          <span>Resultat</span>
+          <strong>Non conforme</strong>
+          {finding.conclusion && <small>{displayValue(finding.conclusion)}</small>}
+        </div>
+      </div>
+
+      {(finding.expected_rule || finding.explanation) && (
+        <div className="doc-finding__rule">
+          <span>Regle documentaire</span>
+          {finding.expected_rule && <p>{displayValue(finding.expected_rule)}</p>}
+          {finding.explanation && <p>{displayValue(finding.explanation)}</p>}
+        </div>
+      )}
+
+      {source && (
+        <div className="doc-finding__source">
+          Source: {source}
+        </div>
+      )}
+    </article>
   )
 }
 
@@ -1328,6 +1550,36 @@ function reportTraceName(transactionGroups = []) {
   return 'trace'
 }
 
+function reportFocusLabel(traceName, data) {
+  const fromTraceName = String(traceName || '').match(/\bED[_\s-]?(\d{1,3})\b/i)
+
+  if (fromTraceName) {
+    return `ED ${fromTraceName[1].padStart(2, '0')}`
+  }
+
+  const firstFailureCode = (data.transactions ?? [])
+    .map((transaction) => transaction?.hsm_analysis?.commands ?? [])
+    .flat()
+    .map((command) => command?.hsm_result_code || command?.return_code)
+    .find(Boolean)
+
+  if (firstFailureCode) {
+    return String(firstFailureCode).toUpperCase()
+  }
+
+  return ''
+}
+
+function reportGeneratedAt() {
+  return new Date().toLocaleString('fr-FR', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
 function buildPrintableReport(data, displayOptions = getDisplayOptions(data)) {
   const statistics = data.statistics ?? {}
   const totalTransactions = statistics.total_transactions ?? data.transactions?.length ?? 0
@@ -1382,6 +1634,63 @@ function buildPrintableReport(data, displayOptions = getDisplayOptions(data)) {
   const traceName = reportTraceName(transactionGroups)
   const reportTitle = `Rapport d'analyse de la trace ${traceName}`
   const logoUrl = new URL(hpsLogo, window.location.origin).href
+  const focusLabel = reportFocusLabel(traceName, data)
+  const displayReportTitle = focusLabel
+    ? `Rapport d'analyse de la trace <span>${escapeHtml(focusLabel)}</span>`
+    : `Rapport d'analyse de la trace`
+  const generatedAt = reportGeneratedAt()
+  const coverStatusClass = failedTransactions > 0 ? 'cover-status--failed' : 'cover-status--success'
+  const coverStatusText = failedTransactions > 0
+    ? `${failedTransactions} / ${totalTransactions} transactions en echec`
+    : `${totalTransactions} transaction(s) sans echec detecte`
+  const traceStem = String(traceName || 'trace').replace(/\.[^.]+$/, '')
+  const coverHtml = `
+    <section class="cover-page">
+      <div class="cover-grid"></div>
+      <div class="cover-top">
+        <img class="cover-logo" src="${escapeHtml(logoUrl)}" alt="HPS">
+        <span class="cover-badge">Analyse deterministe de trace</span>
+      </div>
+
+      <div class="cover-main">
+        <p class="cover-kicker">Diagnostics &amp; observabilite transactionnelle</p>
+        <h1>${displayReportTitle}</h1>
+        <p class="cover-description">
+          Analyse fonction-par-fonction, controle HSM et verification de
+          conformite documentaire pour ${escapeHtml(totalTransactions)}
+          transaction(s) d'autorisation issue(s) du moteur PowerCARD.
+        </p>
+        <div class="cover-file">${escapeHtml(traceName)}</div>
+      </div>
+
+      <div class="cover-cards">
+        <article>
+          <span>Reference document</span>
+          <strong>${escapeHtml(focusLabel || traceStem)}</strong>
+          <small>${escapeHtml(traceStem)}</small>
+        </article>
+        <article>
+          <span>Genere le</span>
+          <strong>${escapeHtml(generatedAt.split(' ')[0] || generatedAt)}</strong>
+          <small>${escapeHtml(generatedAt.split(' ')[1] || '')}</small>
+        </article>
+        <article>
+          <span>Transactions couvertes</span>
+          <strong>${escapeHtml(totalTransactions)}</strong>
+        </article>
+      </div>
+
+      <div class="cover-bottom">
+        <span class="cover-status ${coverStatusClass}">${escapeHtml(coverStatusText)}</span>
+        <span>Analyse deterministe - aucune alerte de fraude detectee automatiquement</span>
+      </div>
+
+      <footer class="cover-footer">
+        <span>Rapport d'analyse de trace</span>
+        <strong>Confidentiel - Usage interne</strong>
+      </footer>
+    </section>
+  `
   const transactionHtml = transactionGroups.map((group, groupIndex) => {
     const groupTransactionsHtml = group.transactions.map((transaction) => {
     const fields = transaction.fields ?? {}
@@ -1494,6 +1803,31 @@ function buildPrintableReport(data, displayOptions = getDisplayOptions(data)) {
           * { box-sizing: border-box; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
           html, body { min-height: 100%; }
           body { margin: 0; color: #172033; background: #ffffff; font-family: Arial, sans-serif; font-size: 12px; line-height: 1.45; }
+          .cover-page { position: relative; min-height: 297mm; overflow: hidden; padding: 28mm 24mm 0; background: #fbfdff; border-left: 10px solid #286fcf; border-radius: 0 24px 24px 0; page-break-after: always; break-after: page; }
+          .cover-grid { position: absolute; inset: 0; background-image: linear-gradient(#ecf1f7 1px, transparent 1px), linear-gradient(90deg, #ecf1f7 1px, transparent 1px); background-size: 20px 20px; opacity: .62; pointer-events: none; }
+          .cover-page::after { content: ""; position: absolute; right: -80mm; top: 24mm; width: 150mm; height: 150mm; border-radius: 50%; background: radial-gradient(circle, rgba(40,111,207,.09), rgba(40,111,207,0) 68%); }
+          .cover-top, .cover-main, .cover-cards, .cover-bottom, .cover-footer { position: relative; z-index: 1; }
+          .cover-top { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+          .cover-logo { width: 76px; height: auto; object-fit: contain; }
+          .cover-badge { padding: 7px 14px; border: 1px solid #e4eaf3; border-radius: 999px; background: rgba(255,255,255,.82); color: #286fcf; font-size: 9px; font-weight: 900; letter-spacing: .14em; text-transform: uppercase; }
+          .cover-main { max-width: 520px; margin-top: 58mm; }
+          .cover-kicker { margin: 0 0 12px; color: #127c89; font-size: 10px; font-weight: 900; letter-spacing: .18em; text-transform: uppercase; }
+          .cover-main h1 { margin: 0; color: #101828; font-size: 34px; line-height: 1.05; font-weight: 900; letter-spacing: -0.02em; }
+          .cover-main h1 span { color: #286fcf; white-space: nowrap; }
+          .cover-description { max-width: 470px; margin: 15px 0 26px; color: #344054; font-size: 13px; line-height: 1.55; }
+          .cover-file { display: inline-flex; max-width: 100%; padding: 11px 15px; border-radius: 4px; background: #101828; color: #ffffff; font-family: Consolas, monospace; font-size: 10px; font-weight: 800; overflow-wrap: anywhere; }
+          .cover-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 82mm; }
+          .cover-cards article { min-height: 64px; padding: 14px 16px; border: 1px solid #e2e8f0; border-radius: 8px; background: rgba(255,255,255,.92); box-shadow: 0 12px 30px rgba(16,24,40,.06); }
+          .cover-cards span { display: block; margin-bottom: 8px; color: #667085; font-size: 8px; font-weight: 900; letter-spacing: .13em; text-transform: uppercase; }
+          .cover-cards strong { display: block; color: #101828; font-size: 12px; line-height: 1.25; overflow-wrap: anywhere; }
+          .cover-cards small { display: block; margin-top: 3px; color: #344054; font-size: 9px; font-weight: 800; overflow-wrap: anywhere; }
+          .cover-bottom { display: flex; align-items: center; gap: 16px; margin-top: 14px; color: #667085; font-size: 9px; }
+          .cover-status { display: inline-flex; align-items: center; justify-content: center; min-width: 164px; padding: 8px 12px; border-radius: 999px; font-size: 9px; font-weight: 900; }
+          .cover-status--failed { border: 1px solid #fecdd3; background: #fff1f3; color: #c01048; }
+          .cover-status--success { border: 1px solid #bbf7d0; background: #ecfdf3; color: #027a48; }
+          .cover-footer { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: space-between; padding: 16px 24mm; background: #101828; color: #ffffff; font-size: 9px; }
+          .cover-footer strong { font-weight: 900; }
+          .report-content { padding: 14mm; }
           .report-shell { max-width: 980px; margin: 0 auto; }
           .report-header { margin-bottom: 18px; padding: 0 0 18px; border-bottom: 2px solid #d9e0ea; display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
           .report-brand { display: flex; align-items: center; gap: 16px; min-width: 0; }
@@ -1537,24 +1871,27 @@ function buildPrintableReport(data, displayOptions = getDisplayOptions(data)) {
           .error-type { color: #c01048; font-weight: 800; }
           .error-detail { background: #fff5f6 !important; color: #7a1f36; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
           ul { margin: 0; padding-left: 18px; }
-          @page { size: A4; margin: 14mm; }
+          @page { size: A4; margin: 0; }
         </style>
       </head>
       <body>
-        <main class="report-shell">
-          <section class="report-header">
-            <div class="report-brand">
-              <img class="report-logo" src="${escapeHtml(logoUrl)}" alt="HPS">
-              <div class="report-title-block">
-                <p class="report-kicker">Rapport d'analyse</p>
-                <h1>${escapeHtml(reportTitle)}</h1>
+        ${coverHtml}
+        <div class="report-content">
+          <main class="report-shell">
+            <section class="report-header">
+              <div class="report-brand">
+                <img class="report-logo" src="${escapeHtml(logoUrl)}" alt="HPS">
+                <div class="report-title-block">
+                  <p class="report-kicker">Rapport d'analyse</p>
+                  <h1>${escapeHtml(reportTitle)}</h1>
+                </div>
               </div>
-            </div>
-            <p class="report-date">${escapeHtml(new Date().toLocaleString('fr-FR'))}</p>
-          </section>
-          ${dashboardHtml}
-          ${transactionHtml}
-        </main>
+              <p class="report-date">${escapeHtml(generatedAt)}</p>
+            </section>
+            ${dashboardHtml}
+            ${transactionHtml}
+          </main>
+        </div>
       </body>
     </html>
   `

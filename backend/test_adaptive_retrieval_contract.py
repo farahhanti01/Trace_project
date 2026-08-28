@@ -33,6 +33,14 @@ class GenericQuestionClassifierTests(unittest.TestCase):
         self.assertEqual(classification.entities.field_numbers, ["039"])
         self.assertEqual(classification.entities.codes, ["51"])
 
+    def test_requested_code_list_is_extracted_for_known_field(self):
+        classification = GenericQuestionClassifier.classify(
+            "Depuis le document, explique le Field 039 avec les codes 00, 05, 51 et 55."
+        )
+
+        self.assertEqual(classification.entities.field_numbers, ["039"])
+        self.assertEqual(classification.entities.codes, ["00", "05", "51", "55"])
+
     def test_table_lookup(self):
         classification = GenericQuestionClassifier.classify(
             "Donne-moi tous les codes du Field 039"

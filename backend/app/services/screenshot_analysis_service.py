@@ -23,6 +23,10 @@ from app.services.hps_ai_service import (
     call_hps_ai,
 )
 from app.services.retrieval_service import select_relevant_sections
+from app.services.field_value_decoder_service import (
+    decode_field_value_from_sources,
+    field_value_decoding_table_block,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -68,6 +72,10 @@ def question_mentions_screenshot(question: str) -> bool:
             "depuis la capture",
             "dans ce screen",
             "dans l'image",
+            "dans la trace",
+            "dans cette trace",
+            "depuis la trace",
+            "depuis cette trace",
             "dans la trace visible",
         )
     )
@@ -143,6 +151,21 @@ def classify_screenshot_intent(question: str) -> str:
         "anomalie",
         "diagnostic",
     )
+
+    if (
+        requested_field
+        and screen_related
+        and any(
+            term in normalized
+            for term in (
+                "que signifie",
+                "que represente",
+                "que reprÃ©sente",
+                "explique",
+            )
+        )
+    ):
+        return SCREEN_VALUE_EXPLANATION
 
     if requested_field and not screen_related and any(
         term in normalized
@@ -599,6 +622,89 @@ def find_observed_iso_field(
     return None
 
 
+def section_matches_field(section: dict[str, Any], field_number: str) -> bool:
+    normalized_field = normalize_field_number(field_number)
+    compact_field = str(int(normalized_field.split(".", 1)[0])) if normalized_field.split(".", 1)[0].isdigit() else normalized_field
+    metadata_field = normalize_field_number(section.get("field_number"))
+
+    if metadata_field and metadata_field == normalized_field:
+        return True
+
+    searchable = " ".join([
+        str(section.get("heading") or ""),
+        str(section.get("text") or "")[:1_000],
+    ])
+
+    return bool(re.search(
+        rf"\b(?:field|fld|champ)\s*0*{re.escape(compact_field)}\b",
+        searchable,
+        flags=re.IGNORECASE,
+    ))
+
+
+def section_supports_field_value_decoding(section: dict[str, Any]) -> bool:
+    searchable = normalize_query_text(
+        " ".join([
+            str(section.get("heading") or ""),
+            str(section.get("text") or ""),
+        ])
+    )
+
+    return any(
+        term in searchable
+        for term in (
+            "valid values",
+            "positions",
+            "position ",
+            "field edits",
+            "reject codes",
+            "code definition",
+            "table",
+        )
+    )
+
+
+def field_decoding_sections(
+    sections: list[dict[str, Any]],
+    field_number: str,
+    *,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    matches = [
+        section
+        for section in sections
+        if section_matches_field(section, field_number)
+        and section_supports_field_value_decoding(section)
+    ]
+
+    return matches[:limit]
+
+
+def merge_sections_by_id(
+    primary: list[dict[str, Any]],
+    secondary: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = []
+    seen = set()
+
+    for section in [*primary, *secondary]:
+        key = (
+            section.get("source_section_id")
+            or section.get("document_id"),
+            section.get("section_index"),
+            section.get("chunk_index"),
+            section.get("heading"),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        merged.append(section)
+
+    return merged
+
+
 def observed_mti(payload: dict[str, Any]) -> str:
     mti = payload.get("mti")
 
@@ -759,6 +865,9 @@ def intent_requires_documentation(
         )
 
     if intent == SCREEN_VALUE_EXPLANATION:
+        if extract_requested_field_number(question):
+            return True
+
         value = extract_mentioned_value(question)
         return bool(re.match(r"^[A-Z]{2}\d{2}$", value or ""))
 
@@ -956,8 +1065,10 @@ async def answer_screenshot_question(
             visible_facts=visible_facts,
         )
 
+    requested_field = extract_requested_field_number(question)
     context = ""
     references: list[dict[str, Any]] = []
+    selected_sections: list[dict[str, Any]] = []
 
     if intent_requires_documentation(
         intent=intent,
@@ -971,6 +1082,11 @@ async def answer_screenshot_question(
         )
         retrieval_query = " ".join([
             question,
+            (
+                f"Field {requested_field} Valid Values Positions table "
+                if requested_field
+                else ""
+            ),
             visible_terms_from_payload(visible_facts),
         ]).strip()
         selected_sections = await select_relevant_sections(
@@ -979,7 +1095,86 @@ async def answer_screenshot_question(
             limit=MAX_SCREENSHOT_CONTEXT_SECTIONS,
             use_embeddings=True,
         )
+        if requested_field:
+            selected_sections = merge_sections_by_id(
+                field_decoding_sections(sections, requested_field),
+                selected_sections,
+            )
         context, references = build_context(selected_sections)
+
+    observed_field = (
+        find_observed_iso_field(visible_facts, requested_field)
+        if requested_field
+        else None
+    )
+
+    if (
+        intent == SCREEN_VALUE_EXPLANATION
+        and requested_field
+        and observed_field
+        and observed_field.get("value")
+        and selected_sections
+    ):
+        decoding = decode_field_value_from_sources(
+            field_number=requested_field,
+            value=observed_field.get("value"),
+            sources=[
+                {
+                    "source_id": source_id_for_index(index),
+                    "text": section.get("text") or "",
+                }
+                for index, section in enumerate(selected_sections)
+            ],
+        )
+
+        if decoding and len(decoding.rows) >= 2:
+            return normalize_screenshot_payload(
+                payload={
+                    "summary": (
+                        f"Dans la capture, le Field {requested_field} vaut "
+                        f"{decoding.raw_value}. Son interpretation se fait "
+                        "par sous-positions documentees."
+                    ),
+                    "sections": [
+                        {
+                            "title": "Valeur observee",
+                            "content": (
+                                f"Field {requested_field} : "
+                                f"{decoding.raw_value}"
+                                + (
+                                    f"\nLigne detectee : {observed_field.get('line')}"
+                                    if observed_field.get("line")
+                                    else ""
+                                )
+                            ),
+                            "source_ids": ["SCREEN"],
+                        },
+                        {
+                            "title": "Decodage par positions",
+                            "content": (
+                                "Le tableau ci-dessous est construit par le "
+                                "backend a partir des positions et mappings "
+                                "retrouves dans la documentation."
+                            ),
+                            "blocks": [field_value_decoding_table_block(decoding)],
+                            "source_ids": decoding.source_ids,
+                        },
+                    ],
+                    "issues": [
+                        {
+                            "severity": "warning",
+                            "title": "Decodage partiel",
+                            "detail": issue,
+                        }
+                        for issue in decoding.issues
+                    ],
+                    "recommendations": [],
+                },
+                references=[
+                    *screenshot_source_reference(),
+                    *references,
+                ],
+            )
 
     image_parts = image_content_parts(image_documents)
 

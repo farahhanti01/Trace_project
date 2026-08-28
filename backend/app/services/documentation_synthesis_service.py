@@ -1328,6 +1328,51 @@ def question_requests_table(question: str) -> bool:
             r"\btableau\b|\btable\b|\bsous\s+forme\s+de\s+tableau\b",
             normalized,
         )
+        or question_requests_code_rows(question)
+    )
+
+
+def requested_code_values(question: str) -> list[str]:
+    """Extrait les codes explicitement listes par l'utilisateur."""
+    normalized = normalize_for_validation(question)
+
+    if not re.search(
+        r"\b(codes?|valeurs?|values?|significations?|meanings?)\b",
+        normalized,
+    ):
+        return []
+
+    field_aliases = requested_field_numbers(question)
+    ignored_tokens = {"AN", "PDF", "MTI", "ISO", "HSM"}
+    codes = []
+
+    for token in re.findall(r"\b[A-Za-z0-9]{2,4}\b", question):
+        code = clean_text(token).upper()
+
+        if code in ignored_tokens:
+            continue
+
+        if code.lstrip("0") in field_aliases:
+            continue
+
+        if not re.search(r"\d", code):
+            continue
+
+        codes.append(code)
+
+    return unique_values(codes)
+
+
+def question_requests_code_rows(question: str) -> bool:
+    """Detecte une demande de lignes code/signification sans exiger le mot tableau."""
+    normalized = normalize_for_validation(question)
+
+    if len(requested_code_values(question)) >= 2:
+        return True
+
+    return bool(
+        re.search(r"\b(codes?|valeurs?|values?)\b", normalized)
+        and re.search(r"\b(significations?|meanings?|definition|definitions?)\b", normalized)
     )
 
 
@@ -1411,6 +1456,12 @@ def repair_pdf_letter_spacing(value: str) -> str:
 def clean_code_meaning(value: str) -> str:
     """Nettoie une signification de code sans exposer un gros extrait brut."""
     meaning = repair_pdf_letter_spacing(value)
+    meaning = re.sub(
+        r"^(?:means?|indicates?|signifie|indique)\s+",
+        "",
+        meaning,
+        flags=re.IGNORECASE,
+    )
     meaning = re.sub(r"\bSource\s+\d+\b.*$", "", meaning, flags=re.IGNORECASE)
     meaning = re.sub(r"\bpage\s+\d+\b.*$", "", meaning, flags=re.IGNORECASE)
     meaning = clean_text(meaning).strip(" .;-:")
@@ -1468,12 +1519,28 @@ def looks_like_table_code_token(token: str, question: str) -> bool:
     return bool(re.search(r"\d", code) or len(code) == 2)
 
 
+def strict_code_table_header_match(text: str) -> re.Match[str] | None:
+    """Repere le debut d'une vraie table code/signification."""
+    return re.search(
+        r"\bcode\b\s+\b(definition|meaning|description|signification)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
 def normalize_table_code_rows(
     text: str,
     source_ids: list[str],
     question: str,
+    *,
+    strict_table_only: bool = False,
 ) -> list[dict[str, str]]:
     """Parse les tables PDF dont les colonnes sont collees par l'extracteur."""
+    strict_header = strict_code_table_header_match(text)
+
+    if strict_table_only and not strict_header:
+        return []
+
     if not re.search(
         r"\bcode\b.{0,80}\bdefinition\b|\bresponse codes?\b",
         text,
@@ -1482,11 +1549,7 @@ def normalize_table_code_rows(
         return []
 
     candidate_text = text
-    split_match = re.search(
-        r"\bcode\b\s+\bdefinition\b",
-        candidate_text,
-        flags=re.IGNORECASE,
-    )
+    split_match = strict_header or strict_code_table_header_match(candidate_text)
 
     if split_match:
         candidate_text = candidate_text[split_match.end():]
@@ -1540,13 +1603,20 @@ def extract_code_rows_from_text(
     text: str,
     source_ids: list[str],
     question: str,
+    *,
+    strict_table_only: bool = False,
 ) -> list[dict[str, str]]:
     """Extrait generiquement des paires code/signification depuis les sources."""
     rows = normalize_table_code_rows(
         text=text,
         source_ids=source_ids,
         question=question,
+        strict_table_only=strict_table_only,
     )
+
+    if strict_table_only:
+        return rows
+
     patterns = (
         r"(?:response\s+code|code\s+de\s+r[ée]ponse|code)\s+"
         r"([A-Z0-9]{2,4})\s+"
@@ -1612,6 +1682,8 @@ def code_rows_from_knowledge(
 def code_rows_from_sections(
     sections: list[dict[str, Any]],
     question: str,
+    *,
+    strict_table_only: bool = False,
 ) -> list[dict[str, str]]:
     """Recupere les codes depuis les extraits RAG selectionnes."""
     rows = []
@@ -1632,6 +1704,7 @@ def code_rows_from_sections(
                 text,
                 [source_id],
                 question,
+                strict_table_only=strict_table_only,
             )
         )
 
@@ -1681,6 +1754,90 @@ def source_ids_from_rows(rows: list[dict[str, str]]) -> list[str]:
     return unique_values(source_ids)
 
 
+def section_looks_like_generated_code_values(
+    section: dict[str, Any],
+    requested_codes: list[str],
+) -> bool:
+    """Detecte une section code/signification generee a remplacer."""
+    title = normalize_for_validation(section.get("title", ""))
+    text = normalize_for_validation(
+        " ".join([
+            clean_text(section.get("title")),
+            section_text(section),
+        ])
+    )
+
+    if not requested_codes or not text:
+        return False
+
+    matching_codes = sum(
+        1
+        for code in requested_codes
+        if re.search(rf"\b{re.escape(code.lower())}\b", text)
+    )
+    has_value_language = bool(
+        re.search(
+            r"\b(code|codes|valeur|valeurs|signification|significations)\b",
+            text,
+        )
+    )
+    title_has_value_language = bool(
+        re.search(
+            r"\b(code|codes|valeur|valeurs|signification|significations)\b",
+            title,
+        )
+    )
+
+    return title_has_value_language or (matching_codes >= 2 and has_value_language)
+
+
+def remove_generated_code_value_sections(
+    sections: list[dict[str, Any]],
+    requested_codes: list[str],
+) -> list[dict[str, Any]]:
+    """Retire les sections de codes produites sans table source fiable."""
+    return [
+        section
+        for section in sections
+        if not (
+            isinstance(section, dict)
+            and section_looks_like_generated_code_values(section, requested_codes)
+        )
+    ]
+
+
+def append_unique_issue(
+    payload: dict[str, Any],
+    issue: dict[str, str],
+) -> None:
+    """Ajoute une note une seule fois meme si la reponse est reparee."""
+    issues = payload.setdefault("issues", [])
+
+    if not isinstance(issues, list):
+        payload["issues"] = issues = []
+
+    issue_identity = (
+        clean_text(issue.get("severity")),
+        clean_text(issue.get("title")),
+        clean_text(issue.get("detail")),
+    )
+
+    for existing in issues:
+        if not isinstance(existing, dict):
+            continue
+
+        existing_identity = (
+            clean_text(existing.get("severity")),
+            clean_text(existing.get("title")),
+            clean_text(existing.get("detail")),
+        )
+
+        if existing_identity == issue_identity:
+            return
+
+    issues.append(issue)
+
+
 def enforce_value_table_when_requested(
     payload: dict[str, Any],
     knowledge: dict[str, Any],
@@ -1689,19 +1846,57 @@ def enforce_value_table_when_requested(
     question: str,
 ) -> dict[str, Any]:
     """Ajoute un vrai tableau de codes si la question le demande explicitement."""
+    requested_codes = requested_code_values(question)
+
     if (
         not question_requests_table(question)
-        or not plan_requests_value_table(plan)
-        or response_has_table(payload)
+        or (not plan_requests_value_table(plan) and not requested_codes)
+        or (response_has_table(payload) and not requested_codes)
     ):
         return payload
 
+    source_rows = code_rows_from_sections(
+        selected_sections,
+        question,
+        strict_table_only=bool(requested_codes),
+    )
+    generated_rows = [] if requested_codes else code_rows_from_knowledge(knowledge, question)
     rows = dedupe_code_rows([
-        *code_rows_from_knowledge(knowledge, question),
-        *code_rows_from_sections(selected_sections, question),
+        *source_rows,
+        *generated_rows,
     ])
 
+    if requested_codes:
+        rows_by_code = {row.get("code"): row for row in rows}
+        rows = [
+            rows_by_code[code]
+            for code in requested_codes
+            if code in rows_by_code
+        ]
+
     if len(rows) < 2:
+        if requested_codes:
+            sections = payload.get("sections")
+
+            if isinstance(sections, list):
+                payload["sections"] = remove_generated_code_value_sections(
+                    sections,
+                    requested_codes,
+                )
+
+            append_unique_issue(
+                payload,
+                {
+                    "severity": "warning",
+                    "title": "Table de codes non confirmee",
+                    "detail": (
+                        "Les codes demandes ont ete detectes dans la question, mais "
+                        "les passages recuperes ne contiennent pas de table "
+                        "code/signification suffisamment fiable. TRACE n'affiche donc "
+                        "pas de mappings deduits depuis du texte narratif."
+                    ),
+                },
+            )
         return payload
 
     sections = payload.get("sections")
@@ -1710,6 +1905,8 @@ def enforce_value_table_when_requested(
         sections = []
 
     source_ids = source_ids_from_rows(rows)
+    if requested_codes:
+        sections = remove_generated_code_value_sections(sections, requested_codes)
     table_section = None
 
     for section in sections:

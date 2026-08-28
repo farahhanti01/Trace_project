@@ -33,6 +33,36 @@ class LogAnalysisAnomalyContractTests(unittest.TestCase):
         self.assertTrue(options["show_hsm"])
         self.assertEqual(options["analysis_mode"], "total")
 
+    def test_trace_analysis_request_displays_hsm_like_complete_analysis(self):
+        options = display_options_for_question("Je veux une analyse de trace.")
+
+        self.assertTrue(options["show_log_story"])
+        self.assertTrue(options["show_hsm"])
+        self.assertEqual(options["analysis_mode"], "total")
+
+    def test_natural_trace_analysis_variants_display_hsm(self):
+        for question in (
+            "Je veux une analyse de la trace.",
+            "Je veux l analyse de la trace.",
+            "Analyse de la trace.",
+            "Peux-tu analyser ce log ?",
+        ):
+            with self.subTest(question=question):
+                options = display_options_for_question(question)
+                self.assertTrue(options["show_log_story"])
+                self.assertTrue(options["show_hsm"])
+                self.assertEqual(options["analysis_mode"], "total")
+
+    def test_hsm_only_request_stays_hsm_focused(self):
+        options = display_options_for_question(
+            "Analyse uniquement les traitements HSM de cette trace."
+        )
+
+        self.assertFalse(options["show_fields"])
+        self.assertFalse(options["show_log_story"])
+        self.assertTrue(options["show_hsm"])
+        self.assertEqual(options["analysis_mode"], "hsm")
+
     def test_referenced_trace_query_does_not_require_log_agent(self):
         query = extracted_trace_document_query("conversation-1")
 

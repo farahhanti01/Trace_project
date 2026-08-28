@@ -214,6 +214,38 @@ class ConversationMemoryResolverTests(unittest.TestCase):
         self.assertEqual(resolved.inherited_entities["field_number"], "002")
         self.assertEqual(resolved.resolved_query, "Quels sont les codes ou valeurs du Field 002 ?")
 
+    def test_explicit_code_list_is_not_reduced_to_first_code(self):
+        question = (
+            "Depuis le document BASE I Technical Specifications, explique le Field 039. "
+            "Je veux les valeurs importantes 00, 05, 51, 55 et leur signification exacte."
+        )
+        resolved = ConversationContextResolver.resolve(question, state())
+
+        self.assertFalse(resolved.used_memory)
+        self.assertEqual(resolved.explicit_entities["field_number"], "039")
+        self.assertEqual(resolved.explicit_entities["codes"], ["00", "05", "51", "55"])
+        self.assertIn("Codes demandes: 00, 05, 51, 55", resolved.resolved_query)
+        self.assertNotEqual(resolved.resolved_query, "Que signifie Field 039 = 00 ?")
+        classification = self.classify(resolved.resolved_query)
+        self.assertEqual(classification.entities.codes, ["00", "05", "51", "55"])
+
+    def test_code_list_followup_inherits_active_field_without_losing_codes(self):
+        resolved = ConversationContextResolver.resolve(
+            "Compare les codes 00, 51 et 55",
+            state(active_entities={"field_number": "039"}),
+        )
+
+        self.assertTrue(resolved.used_memory)
+        self.assertEqual(resolved.inherited_entities["field_number"], "039")
+        self.assertEqual(resolved.explicit_entities["codes"], ["00", "51", "55"])
+        self.assertEqual(
+            resolved.resolved_query,
+            "Compare les codes 00, 51, 55 du Field 039 avec leurs significations documentaires.",
+        )
+        classification = self.classify(resolved.resolved_query)
+        self.assertEqual(classification.entities.field_numbers, ["039"])
+        self.assertEqual(classification.entities.codes, ["00", "51", "55"])
+
     def test_missing_active_context_marks_pronominal_followup_ambiguous(self):
         resolved = ConversationContextResolver.resolve(
             "Est-il obligatoire ?",
