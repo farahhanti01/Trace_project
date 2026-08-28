@@ -112,23 +112,7 @@ Create or update:
 backend/.env
 ```
 
-Template:
 
-```env
-MONGODB_URL=mongodb://trace:trace123@127.0.0.1:27017/?authSource=admin
-MONGODB_DB=trace_ai
-
-OCEAN_AI_BASE_URL=https://your-ai-endpoint.example.com/api/v1/chat/completions
-OCEAN_AI_API_KEY=your_api_key_here
-HPS_AI_MODEL=openai:gpt-4o-mini
-HPS_EMBEDDING_MODEL=openai:text-embedding-3-small
-
-DOCUMENTATION_CONVERSATION_MEMORY=true
-DOCUMENTATION_EVIDENCE_SHADOW=false
-DOCUMENTATION_EVIDENCE_GENERATION=false
-```
-
-Do not commit real API keys.
 
 ### Frontend
 
